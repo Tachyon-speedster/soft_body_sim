@@ -19,3 +19,11 @@ find ~ -iname "isaac_cut_viewer.py" 2>/dev/null
 
 cd /home/zenlab/isaacsim          # <- your actual path from step 1
 ./python.sh /home/zenlab/warp_cut/isaac_cut_viewer.py   # <- your actual path from step 2
+
+
+cd /home/zenlab/isaac-sim/isaac-sim-standalone-5.1.0-linux-x86_64
+
+./python.sh /home/zenlab/warp_cut/isaac_cut_viewer.py
+
+source ~/warp-venv/bin/activate
+python3 /home/zenlab/warp_cut/mouse_control.py
