@@ -10,3 +10,12 @@ python3 warp_step2_forced_break.py
 
 cd /path/to/isaac_sim_install
 ./python.sh /path/to/isaac_cut_viewer.py
+
+find ~ -maxdepth 4 -iname "python.sh" 2>/dev/null
+
+find / -maxdepth 6 -iname "python.sh" -path "*isaac*" 2>/dev/null
+
+find ~ -iname "isaac_cut_viewer.py" 2>/dev/null
+
+cd /home/zenlab/isaacsim          # <- your actual path from step 1
+./python.sh /home/zenlab/warp_cut/isaac_cut_viewer.py   # <- your actual path from step 2
