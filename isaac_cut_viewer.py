@@ -327,7 +327,8 @@ def main():
         sim.step()
 
         pos_np = sim.x.numpy()
-        mesh.GetPointsAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*p) for p in pos_np]))
+        mesh.GetPointsAttr().Set(Vt.Vec3fArray(
+            [Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in pos_np]))
         face_indices = [i for tri in sim.faces for i in tri]
         mesh.GetFaceVertexIndicesAttr().Set(face_indices)
 
