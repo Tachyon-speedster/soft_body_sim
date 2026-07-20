@@ -6,3 +6,7 @@ content = content.replace('gravity_vec = wp.vec3(0.0, -9.81, 0.0)', 'gravity_vec
 open('warp_step2_forced_break.py', 'w').write(content)
 "
 python3 warp_step2_forced_break.py
+
+
+cd /path/to/isaac_sim_install
+./python.sh /path/to/isaac_cut_viewer.py
