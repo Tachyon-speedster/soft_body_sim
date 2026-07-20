@@ -9,7 +9,7 @@ dx = size_x / (nx - 1)
 dy = size_y / (ny - 1)
 r_cut = ny // 2
 
-delta_c = 0.0005  
+delta_c = 0.0005  # 0.5mm critical opening -- cohesive constraint breaks here
 
 
 def idx(r, c):
@@ -67,6 +67,14 @@ def apply_correction(x_pred: wp.array(dtype=wp.vec3), corr: wp.array(dtype=wp.ve
 
 
 @wp.kernel
+def clamp_velocity(v: wp.array(dtype=wp.vec3), max_speed: wp.float32):
+    tid = wp.tid()
+    speed = wp.length(v[tid])
+    if speed > max_speed:
+        v[tid] = v[tid] * (max_speed / speed)
+
+
+@wp.kernel
 def update_velocity(x: wp.array(dtype=wp.vec3), x_pred: wp.array(dtype=wp.vec3),
                      v: wp.array(dtype=wp.vec3), inv_mass: wp.array(dtype=wp.float32),
                      dt: wp.float32):
@@ -85,7 +93,7 @@ def build_mesh():
 
     inv_mass = np.full(len(positions), 1.0 / 0.007, dtype=np.float32)
     for c in range(nx):
-        inv_mass[idx(0, c)] = 0.0  
+        inv_mass[idx(0, c)] = 0.0  # pin top row
 
     edges_a, edges_b, rest, compliance = [], [], [], []
     STRUCT_COMPLIANCE = 1.0e-7
@@ -119,16 +127,16 @@ def main():
     n_active_constraints = len(edges_a)
     active_flags = [1] * n_active_constraints
 
+    # book-keeping for the knife sweep
+    duplicated = {}          # column -> duplicate particle index
+    cohesive_constraint_idx = {}  # column -> index into the constraint arrays
 
-    duplicated = {}          
-    cohesive_constraint_idx = {}  
-
-    gravity_vec = wp.vec3(0.0, -9.81, 0.0)
+    gravity_vec = wp.vec3(0.0, -9.81 * 40.0, 0.0)  # exaggerated pull, to force a real break and test it
     dt = 1.0 / 60.0
     substeps = 10
     sub_dt = dt / substeps
     iterations = 8
-    COHESIVE_COMPLIANCE = 5.0e-9  
+    COHESIVE_COMPLIANCE = 5.0e-9  # stiffer than structural -> holds firmly until it breaks
 
     n_frames = 240
     knife_sweep_frames = 150
@@ -142,7 +150,7 @@ def main():
     v = wp.zeros(len(positions), dtype=wp.vec3)
 
     for frame in range(n_frames):
-    
+        # --- knife sweep: duplicate newly-reached columns this frame ---
         knife_col = int((nx - 1) * min(1.0, frame / knife_sweep_frames))
         newly_cut = []
         for c in range(knife_col + 1):
@@ -155,7 +163,9 @@ def main():
                 newly_cut.append(c)
 
         if newly_cut:
-            
+            # retarget lower-side structural connections to the duplicate,
+            # and add the cohesive constraint + any lower-side rigid links
+            # to already-duplicated neighbor columns
             for c in newly_cut:
                 orig_i = idx(r_cut, c)
                 dup_i = duplicated[c]
@@ -165,14 +175,14 @@ def main():
                         edges_a[i] = dup_i
                     elif b == orig_i and a // nx > r_cut:
                         edges_b[i] = dup_i
-                
+                # cohesive constraint (zero rest length -- pulls dup back to orig)
                 edges_a.append(orig_i)
                 edges_b.append(dup_i)
                 rest.append(0.0)
                 compliance.append(COHESIVE_COMPLIANCE)
                 active_flags.append(1)
                 cohesive_constraint_idx[c] = len(edges_a) - 1
-                
+                # lower-side rigid link to already-cut neighbor(s)
                 if (c - 1) in duplicated:
                     edges_a.append(duplicated[c - 1])
                     edges_b.append(dup_i)
@@ -186,7 +196,7 @@ def main():
                     compliance.append(1.0e-7)
                     active_flags.append(1)
 
-        
+            # arrays changed size -> rebuild all GPU buffers this frame
             n = len(positions)
             x = wp.array(np.array(positions, dtype=np.float32), dtype=wp.vec3)
             v_np = v.numpy()
@@ -217,8 +227,9 @@ def main():
                                   compliance_wp, active_wp, sub_dt, lagrange, corr, corr_w])
                 wp.launch(apply_correction, dim=n, inputs=[x_pred, corr, corr_w])
             wp.launch(update_velocity, dim=n, inputs=[x, x_pred, v, inv_mass_wp, sub_dt])
+            wp.launch(clamp_velocity, dim=n, inputs=[v, 2.0])  # cap at 2 m/s -- standard PBD safety valve
 
-        
+        # --- check cohesive constraints for breakage ---
         pos_np = x.numpy()
         for c, ci in list(cohesive_constraint_idx.items()):
             if active_flags[ci] == 0:
