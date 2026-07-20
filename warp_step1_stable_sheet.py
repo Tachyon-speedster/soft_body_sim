@@ -1,8 +1,3 @@
-"""
-Step 1: verify a stable XPBD sheet simulation with NO cutting yet.
-Must settle sanely under gravity with no explosion -- baseline sanity
-check before adding any cutting logic on top.
-"""
 import warp as wp
 import numpy as np
 
@@ -84,7 +79,7 @@ def build_mesh():
 
     inv_mass = np.full(len(positions), 1.0 / 0.007, dtype=np.float32)
     for c in range(nx):
-        inv_mass[idx(0, c)] = 0.0  # pin top row
+        inv_mass[idx(0, c)] = 0.0 
 
     edges_a, edges_b, rest = [], [], []
 
@@ -128,7 +123,7 @@ def main():
     substeps = 10
     sub_dt = dt / substeps
     iterations = 8
-    compliance = 1.0e-7  # small -> stiff-ish but stable structural material
+    compliance = 1.0e-7  
 
     n_frames = 120
     for frame in range(n_frames):
