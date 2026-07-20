@@ -1,0 +1,8 @@
+cd ~/warp_cut
+python3 -c "
+content = open('warp_step2_cutting.py').read()
+content = content.replace('COHESIVE_COMPLIANCE = 5.0e-9', 'COHESIVE_COMPLIANCE = 5.0e-6')
+content = content.replace('gravity_vec = wp.vec3(0.0, -9.81, 0.0)', 'gravity_vec = wp.vec3(0.0, -9.81 * 40.0, 0.0)')
+open('warp_step2_forced_break.py', 'w').write(content)
+"
+python3 warp_step2_forced_break.py
