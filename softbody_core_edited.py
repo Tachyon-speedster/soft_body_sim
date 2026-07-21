@@ -1,13 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: Apache-2.0
-#
-# softbody_core.py
-#
-# Scene: a flat skin-colored soft-body pad (10x10cm, 2cm tall, tet mesh XPBD)
-# sitting on top of a rigid black base cuboid (15x15cm, 5cm tall).
-# Any prim with PhysicsCollisionAPI pokes the soft body.
-# GeoMagic Touch drives the probe prim.
-
 from __future__ import annotations
 
 import math
