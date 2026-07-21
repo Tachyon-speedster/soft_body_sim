@@ -1,3 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+#
+# softbody_core.py
+#
+# Scene: a flat skin-colored soft-body pad (10x10cm, 2cm tall, tet mesh XPBD)
+# sitting on top of a rigid black base cuboid (15x15cm, 5cm tall).
+# Any prim with PhysicsCollisionAPI pokes the soft body.
+# GeoMagic Touch drives the probe prim.
+
 from __future__ import annotations
 
 import math
@@ -67,7 +77,7 @@ SKIN = 0.005   # 1 mm collision skin
 # ---------------------------------------------------------------------------
 DT            = 1.0 / 60.0
 SUBSTEPS      = 12
-SOLVER_ITERS  = 10
+SOLVER_ITERS  = 4   # fewer iterations -- see k_edge/k_vol note below
 
 # ---------------------------------------------------------------------------
 # Cutting constants (virtual-node duplication + breakable cohesive constraint)
@@ -582,8 +592,8 @@ class SoftBodyCube:
         res_y=10,
         res_z=4,
         total_mass=1.0,
-        k_edge=0.95,
-        k_vol=0.95,
+        k_edge=0.25,
+        k_vol=0.35,
         device=None,
     ):
         self.device = device
@@ -1228,10 +1238,22 @@ class WarpSoftBodySim:
 
         stage = omni.usd.get_context().get_stage()
         DEAD  = 5e-4
+        MAX_DRAG = 0.02   # 2cm/frame safety clamp -- prevents viewport
+                          # gizmo grid-snap (often 1 unit = 1m by default)
+                          # from ever producing a huge, physically
+                          # impossible jump regardless of root cause
+
+        def _clamp_delta(dx, dy, dz):
+            mag = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if mag > MAX_DRAG:
+                s = MAX_DRAG / mag
+                return dx * s, dy * s, dz * s
+            return dx, dy, dz
 
         # Soft body drag
         px, py, pz = self._prim_world_translation(SOFT_BODY_PRIM_PATH)
         if abs(px)>DEAD or abs(py)>DEAD or abs(pz)>DEAD:
+            px, py, pz = _clamp_delta(px, py, pz)
             self._cube.drag((px,py,pz), dt=DT)
             self._clear_prim_xform(SOFT_BODY_PRIM_PATH)
 
@@ -1239,6 +1261,7 @@ class WarpSoftBodySim:
         if self._probe is not None:
             vx,vy,vz = self._prim_world_translation(PROBE_PRIM_PATH)
             if abs(vx)>DEAD or abs(vy)>DEAD or abs(vz)>DEAD:
+                vx, vy, vz = _clamp_delta(vx, vy, vz)
                 cur = self._probe_translate_op.Get()
                 self._probe_translate_op.Set(
                     Gf.Vec3d(cur[0]+vx, cur[1]+vy, cur[2]+vz))
@@ -1263,11 +1286,13 @@ class WarpSoftBodySim:
         colliders = gather_colliders(stage, skip, self._xform_cache)
 
         # Probe collider from translate op
+        probe_world = None
         if self._probe is not None:
             p = self._probe_translate_op.Get()
+            probe_world = (float(p[0]), float(p[1]), float(p[2]))
             colliders.append({
                 "shape":  SHAPE_BOX,
-                "center": (float(p[0]), float(p[1]), float(p[2])),
+                "center": probe_world,
                 "row0":   Gf.Vec3f(1.0, 0.0, 0.0),
                 "row1":   Gf.Vec3f(0.0, 1.0, 0.0),
                 "row2":   Gf.Vec3f(0.0, 0.0, 1.0),
@@ -1275,6 +1300,22 @@ class WarpSoftBodySim:
                 "half_y": float(PROBE_HALF_Y),
                 "half_z": float(PROBE_HALF_Z),
             })
+
+        # ---- Cutting: advance the cut to wherever the probe currently is,
+        # only while the probe is actually pressed into the pad (within its
+        # Y footprint and pushed down to/past its top surface) ----
+        if probe_world is not None:
+            pwx, pwy, pwz = probe_world
+            pad_top_z = SOFT_CENTER[2] + SOFT_HALF_Z
+            engaged = (
+                abs(pwy - SOFT_CENTER[1]) < SOFT_HALF_Y
+                and pwz < pad_top_z + SKIN
+            )
+            if engaged:
+                frac = (pwx - (SOFT_CENTER[0] - SOFT_HALF_X)) / (2 * SOFT_HALF_X)
+                target_col = int(round(frac * (SOFT_RES_X - 1)))
+                target_col = max(0, min(SOFT_RES_X - 1, target_col))
+                self._cube.advance_cut(target_col)
 
         # Physics step — base collision passed separately so it runs every
         # solver iteration (same priority as ground constraint)
@@ -1290,10 +1331,16 @@ class WarpSoftBodySim:
             static_friction=0.98,
             colliders=colliders,
         )
+        self._cube._check_cohesive_breaks()
 
-        # Write positions to USD render mesh
+        # Write positions to USD render mesh. Face-vertex INDICES are
+        # re-set every frame too (not just at spawn) -- cutting doesn't
+        # change how many triangles there are, but it does change which
+        # vertices they point to, and the point buffer itself can grow.
         self._cube_mesh.GetPointsAttr().Set(
             _vec3f_list(self._cube.pos.numpy()))
+        self._cube_mesh.GetFaceVertexIndicesAttr().Set(
+            self._cube.tri_indices.tolist())
         return False
 
     # ------------------------------------------------------------------
@@ -1307,8 +1354,8 @@ class WarpSoftBodySim:
             res_y=SOFT_RES_Y,
             res_z=SOFT_RES_Z,
             total_mass=0.5,
-            k_edge=0.95,
-            k_vol=0.95,
+            k_edge=0.25,
+            k_vol=0.35,
             device=self._device,
         )
         fc = np.full(len(self._cube.tri_indices)//3, 3, dtype=np.int32)
