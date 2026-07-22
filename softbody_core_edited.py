@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import numpy as np
 import warp as wp
+import carb
 import omni.usd
 from isaacsim.core.api.objects import GroundPlane
 from isaacsim.core.utils.viewports import set_camera_view
@@ -1037,6 +1038,8 @@ class WarpSoftBodySim:
         self._ground             = None
         self._device             = None
         self._xform_cache        = None
+        self._probe_last_good    = None   # last accepted probe world pos,
+                                           # used to clamp per-frame movement
 
     # ------------------------------------------------------------------
     def load_example_assets(self):
@@ -1144,11 +1147,13 @@ class WarpSoftBodySim:
             return dx, dy, dz
 
         # Soft body drag
-        px, py, pz = self._prim_world_translation(SOFT_BODY_PRIM_PATH)
-        if abs(px)>DEAD or abs(py)>DEAD or abs(pz)>DEAD:
-            px, py, pz = _clamp_delta(px, py, pz)
-            self._cube.drag((px,py,pz), dt=DT)
-            self._clear_prim_xform(SOFT_BODY_PRIM_PATH)
+        soft_body_read = self._prim_world_translation(SOFT_BODY_PRIM_PATH)
+        if soft_body_read is not None:
+            px, py, pz = soft_body_read
+            if abs(px)>DEAD or abs(py)>DEAD or abs(pz)>DEAD:
+                px, py, pz = _clamp_delta(px, py, pz)
+                self._cube.drag((px,py,pz), dt=DT)
+                self._clear_prim_xform(SOFT_BODY_PRIM_PATH)
 
         # Probe viewport drag -- the probe is a simple kinematic collider,
         # not something that needs delta-accumulation like the soft body
@@ -1166,9 +1171,25 @@ class WarpSoftBodySim:
         # everything down to zero first, then setting the one canonical
         # op, is safe regardless of which behavior the gizmo actually has.
         if self._probe is not None:
-            vx, vy, vz = self._prim_world_translation(PROBE_PRIM_PATH)
-            self._clear_prim_xform(PROBE_PRIM_PATH)
-            self._probe_translate_op.Set(Gf.Vec3d(vx, vy, vz))
+            probe_read = self._prim_world_translation(PROBE_PRIM_PATH)
+            if probe_read is None:
+                # Couldn't get a valid read this frame (e.g. mid-drag while
+                # the gizmo is rewriting xformOps) -- keep the probe exactly
+                # where it already is rather than guessing, so it never
+                # snaps to the origin.
+                pass
+            else:
+                vx, vy, vz = probe_read
+                if self._probe_last_good is None:
+                    # First valid read since spawn -- accept it outright.
+                    self._probe_last_good = (vx, vy, vz)
+                else:
+                    lx, ly, lz = self._probe_last_good
+                    dx, dy, dz = _clamp_delta(vx - lx, vy - ly, vz - lz)
+                    vx, vy, vz = lx + dx, ly + dy, lz + dz
+                    self._probe_last_good = (vx, vy, vz)
+                self._clear_prim_xform(PROBE_PRIM_PATH)
+                self._probe_translate_op.Set(Gf.Vec3d(vx, vy, vz))
 
         # Gather external colliders (skip base and probe — handled separately)
         self._xform_cache.Clear()
@@ -1227,14 +1248,27 @@ class WarpSoftBodySim:
         # re-set every frame too (not just at spawn) -- cutting doesn't
         # change how many triangles there are, but it does change which
         # vertices they point to, and the point buffer itself can grow.
-        self._cube_mesh.GetPointsAttr().Set(
-            _vec3f_list(self._cube.pos.numpy()))
+        #
+        # Safety net: if the solver ever blows up (NaN/Inf positions, from
+        # any cause), do NOT push that into the renderer -- a degenerate
+        # mesh like that is a plausible way to crash the RTX/Kit renderer
+        # outright rather than just looking wrong. Skip the mesh write for
+        # this frame and warn instead.
+        cube_pos_np = self._cube.pos.numpy()
+        if not np.all(np.isfinite(cube_pos_np)):
+            carb.log_warn(
+                "[WarpSoftBody] non-finite particle positions detected -- "
+                "skipping this frame's mesh update to avoid handing the "
+                "renderer a degenerate mesh.")
+            return False
+        self._cube_mesh.GetPointsAttr().Set(_vec3f_list(cube_pos_np))
         self._cube_mesh.GetFaceVertexIndicesAttr().Set(
             self._cube.tri_indices.tolist())
         return False
 
     # ------------------------------------------------------------------
     def _spawn(self):
+        self._probe_last_good = None
         self._cube = SoftBodyCube(
             center=SOFT_CENTER,
             half_x=SOFT_HALF_X,
@@ -1261,16 +1295,27 @@ class WarpSoftBodySim:
             Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
 
     def _prim_world_translation(self, prim_path):
+        """Return (x, y, z) world translation, or None if it can't be read
+        right now. Returning None (instead of silently defaulting to the
+        origin) matters: whatever calls this must NOT treat a failed read
+        as "prim is at (0,0,0)", or a transient read failure (e.g. mid-drag
+        while the viewport gizmo is rewriting the prim's xformOps) will
+        teleport that prim straight to the origin for a frame."""
         stage = omni.usd.get_context().get_stage()
-        if stage is None: return 0.0, 0.0, 0.0
+        if stage is None: return None
         prim = stage.GetPrimAtPath(prim_path)
-        if not prim.IsValid(): return 0.0, 0.0, 0.0
+        if not prim.IsValid(): return None
         try:
             mat = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
             t   = mat.ExtractTranslation()
-            return float(t[0]), float(t[1]), float(t[2])
-        except Exception:
-            return 0.0, 0.0, 0.0
+            x, y, z = float(t[0]), float(t[1]), float(t[2])
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                return None
+            return x, y, z
+        except Exception as e:
+            carb.log_warn(f"[WarpSoftBody] failed to read world transform "
+                           f"for {prim_path}: {e}")
+            return None
 
     def _clear_prim_xform(self, prim_path):
         stage = omni.usd.get_context().get_stage()
