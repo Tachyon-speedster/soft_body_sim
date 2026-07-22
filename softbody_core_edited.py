@@ -1129,6 +1129,20 @@ class WarpSoftBodySim:
 
     # ------------------------------------------------------------------
     def update(self, step: float):
+        """Thin wrapper around _update_impl(): any exception during a
+        frame's update -- USD xformOp quirks, transient stage state, etc --
+        gets logged and skipped rather than propagating up and silently
+        killing physics stepping for the rest of the session (which is
+        what happened before: an uncaught exception here looks exactly
+        like "the sim just stopped simulating")."""
+        try:
+            return self._update_impl(step)
+        except Exception as e:
+            carb.log_warn(f"[WarpSoftBody] update() failed this frame, "
+                           f"skipping: {e}")
+            return False
+
+    def _update_impl(self, step: float):
         if self._cube is None:
             return False
 
@@ -1323,8 +1337,42 @@ class WarpSoftBodySim:
         prim = stage.GetPrimAtPath(prim_path)
         if not prim.IsValid(): return
         for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
-            t = op.GetOpType()
-            if   t == UsdGeom.XformOp.TypeTranslate: op.Set(Gf.Vec3d(0,0,0))
-            elif t == UsdGeom.XformOp.TypeRotateXYZ: op.Set(Gf.Vec3f(0,0,0))
-            elif t == UsdGeom.XformOp.TypeOrient:    op.Set(Gf.Quatd(1,0,0,0))
-            # scale: never zero
+            try:
+                t = op.GetOpType()
+                # IMPORTANT: match the op's own precision. Ops we create
+                # ourselves default to double, but Kit's viewport gizmo
+                # (move/rotate tool) can add ops -- e.g. xformOp:orient --
+                # typed as single-precision (GfQuatf/GfVec3f). Setting a
+                # double-precision value on a float-precision op raises a
+                # Tf.ErrorException that, if uncaught, aborts the entire
+                # update() call before it ever reaches the physics step --
+                # which looks like "the sim just stopped simulating".
+                precision = op.GetPrecision()
+                if t == UsdGeom.XformOp.TypeTranslate:
+                    if precision == UsdGeom.XformOp.PrecisionFloat:
+                        op.Set(Gf.Vec3f(0, 0, 0))
+                    elif precision == UsdGeom.XformOp.PrecisionHalf:
+                        op.Set(Gf.Vec3h(0, 0, 0))
+                    else:
+                        op.Set(Gf.Vec3d(0, 0, 0))
+                elif t == UsdGeom.XformOp.TypeRotateXYZ:
+                    if precision == UsdGeom.XformOp.PrecisionDouble:
+                        op.Set(Gf.Vec3d(0, 0, 0))
+                    elif precision == UsdGeom.XformOp.PrecisionHalf:
+                        op.Set(Gf.Vec3h(0, 0, 0))
+                    else:
+                        op.Set(Gf.Vec3f(0, 0, 0))
+                elif t == UsdGeom.XformOp.TypeOrient:
+                    if precision == UsdGeom.XformOp.PrecisionDouble:
+                        op.Set(Gf.Quatd(1, 0, 0, 0))
+                    elif precision == UsdGeom.XformOp.PrecisionHalf:
+                        op.Set(Gf.Quath(1, 0, 0, 0))
+                    else:
+                        op.Set(Gf.Quatf(1, 0, 0, 0))
+                # scale: never zero
+            except Exception as e:
+                # Never let a single op's type quirk abort the whole frame
+                # (and with it, the physics step and mesh update below it).
+                carb.log_warn(
+                    f"[WarpSoftBody] failed to clear xformOp "
+                    f"{op.GetOpName()} on {prim_path}: {e}")
