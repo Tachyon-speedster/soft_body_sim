@@ -67,7 +67,7 @@ SKIN = 0.005   # 1 mm collision skin
 # ---------------------------------------------------------------------------
 DT            = 1.0 / 60.0
 SUBSTEPS      = 12
-SOLVER_ITERS  = 4   # fewer iterations -- see k_edge/k_vol note below
+SOLVER_ITERS  = 8   # moderate reduction from original 10 -- see note below
 
 # ---------------------------------------------------------------------------
 # Cutting constants (virtual-node duplication + breakable cohesive constraint)
@@ -582,8 +582,8 @@ class SoftBodyCube:
         res_y=10,
         res_z=4,
         total_mass=1.0,
-        k_edge=0.25,
-        k_vol=0.35,
+        k_edge=0.65,
+        k_vol=0.6,
         device=None,
     ):
         self.device = device
@@ -1247,15 +1247,25 @@ class WarpSoftBodySim:
             self._cube.drag((px,py,pz), dt=DT)
             self._clear_prim_xform(SOFT_BODY_PRIM_PATH)
 
-        # Probe viewport drag
-        if self._probe is not None:
-            vx,vy,vz = self._prim_world_translation(PROBE_PRIM_PATH)
-            if abs(vx)>DEAD or abs(vy)>DEAD or abs(vz)>DEAD:
-                vx, vy, vz = _clamp_delta(vx, vy, vz)
-                cur = self._probe_translate_op.Get()
-                self._probe_translate_op.Set(
-                    Gf.Vec3d(cur[0]+vx, cur[1]+vy, cur[2]+vz))
-                self._clear_prim_xform(PROBE_PRIM_PATH)
+        # Probe viewport drag -- the probe is a simple kinematic collider,
+        # not something that needs delta-accumulation like the soft body
+        # does. Just read its current world position directly and use it.
+        #
+        # IMPORTANT: we read the position, then explicitly clear ALL
+        # transform ops on the prim, THEN set _probe_translate_op to the
+        # value we read. This matters because we don't know for certain
+        # whether Isaac Sim's move gizmo edits _probe_translate_op in
+        # place, or stacks a second translate op on top of it. If it's
+        # the latter and we only .Set() the first op, the second op would
+        # still be sitting there non-zero, and next frame's world reading
+        # would include it AGAIN on top of the value we just wrote --
+        # compounding a little further every single frame. Clearing
+        # everything down to zero first, then setting the one canonical
+        # op, is safe regardless of which behavior the gizmo actually has.
+        if self._probe is not None and not self._geo_enabled:
+            vx, vy, vz = self._prim_world_translation(PROBE_PRIM_PATH)
+            self._clear_prim_xform(PROBE_PRIM_PATH)
+            self._probe_translate_op.Set(Gf.Vec3d(vx, vy, vz))
 
         # GeoMagic
         if self._geo_enabled:
@@ -1344,8 +1354,8 @@ class WarpSoftBodySim:
             res_y=SOFT_RES_Y,
             res_z=SOFT_RES_Z,
             total_mass=0.5,
-            k_edge=0.25,
-            k_vol=0.35,
+            k_edge=0.65,
+            k_vol=0.6,
             device=self._device,
         )
         fc = np.full(len(self._cube.tri_indices)//3, 3, dtype=np.int32)
