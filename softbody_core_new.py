@@ -55,6 +55,13 @@ ROD_HALF_LEN = ROD_LENGTH * 0.5
 PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + ROD_LENGTH + 0.01)
 PROBE_COLOR  = np.array([0.75, 0.45, 0.15])
 
+# Tissue colors: the pad's outer surface reads as skin; any face exposed
+# by cutting into the interior (i.e. not part of the original outer
+# surface) reads as muscle, so a cut visually opens up "into" the body
+# rather than just showing more of the same skin-colored material.
+SKIN_TISSUE_COLOR   = np.array([0.41, 0.22, 0.16])   # unchanged skin tone
+MUSCLE_TISSUE_COLOR = np.array([0.55, 0.05, 0.06])   # deep muscle red
+
 # Keep PIPE_* aliases for gather_colliders compatibility
 PIPE_PRIM_PATH       = PROBE_PRIM_PATH
 PIPE_RADIUS          = ROD_RADIUS
@@ -719,6 +726,24 @@ class SoftBodyCube:
 
         inv_mass = np.full(n, n / total_mass, dtype=np.float32)
 
+        # ── Skin vs. muscle classification ───────────────────────────────
+        # A grid vertex sits on the box's true outer surface iff it's on
+        # the first/last index along ANY axis. Faces built entirely from
+        # such vertices are the original outer skin; any boundary face
+        # that later includes a vertex NOT on this surface can only have
+        # been exposed by a cut slicing into the interior, so it reads as
+        # muscle instead. This list only ever grows (duplicates copy their
+        # source's flag), so the classification of a given piece of
+        # material never changes once assigned.
+        ix_idx, iy_idx, iz_idx = np.meshgrid(
+            np.arange(res_x), np.arange(res_y), np.arange(res_z), indexing="ij")
+        is_boundary = (
+            (ix_idx == 0) | (ix_idx == res_x - 1) |
+            (iy_idx == 0) | (iy_idx == res_y - 1) |
+            (iz_idx == 0) | (iz_idx == res_z - 1)
+        ).flatten()
+        self._is_boundary_list = is_boundary.tolist()
+
         def vidx(ix, iy, iz):
             return ix * res_y * res_z + iy * res_z + iz
 
@@ -865,6 +890,13 @@ class SoftBodyCube:
         self._tet_vol_list   = vols.astype(np.float32).tolist()
         self._tet_stiff_list = [float(k_vol)] * self.num_tets
         self._tri_list       = [list(t) for t in oriented]
+
+        # Every face at spawn time is, by construction, part of the whole
+        # box's true outer surface (no cuts have happened yet) -- so it's
+        # all skin. Interior "muscle" faces only ever appear later, once
+        # cutting exposes them (see _rebuild_boundary_tris).
+        self._tri_color_list = [list(SKIN_TISSUE_COLOR)] * len(oriented)
+        self.tri_colors = np.array(self._tri_color_list, dtype=np.float32)
 
     def centroid(self):
         p = self.pos.numpy(); c = p.mean(0)
@@ -1090,6 +1122,7 @@ class SoftBodyCube:
             self._vel_list.append(list(self._vel_list[src]))
             self._inv_mass_list.append(self._inv_mass_list[src])
             self._rest_pos_list.append(list(self._rest_pos_list[src]))
+            self._is_boundary_list.append(self._is_boundary_list[src])
         self.cohesive.append({"a": src_base, "b": new_base})
         return new_base
 
@@ -1146,7 +1179,14 @@ class SoftBodyCube:
 
     def _rebuild_boundary_tris(self):
         """Recompute the render-mesh boundary faces from scratch from the
-        current self._tets_list (a face belongs to exactly one tet)."""
+        current self._tets_list (a face belongs to exactly one tet).
+
+        Also classifies each face as skin or muscle: a face keeps its
+        "skin" look only if all 3 corners are original outer-surface
+        vertices (see _is_boundary_list); any boundary face touching a
+        vertex that was originally interior can only exist because a cut
+        exposed it, so it reads as muscle instead. Returns
+        (oriented_triangles, per_face_colors)."""
         tet_faces = [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
         fc, fw = {}, {}
         for tet in self._tets_list:
@@ -1160,6 +1200,9 @@ class SoftBodyCube:
         pos = np.array(self._pos_list, dtype=np.float32)
         gcen = pos.mean(0)
         oriented = []
+        colors = []
+        is_bnd = self._is_boundary_list
+        skin, muscle = list(SKIN_TISSUE_COLOR), list(MUSCLE_TISSUE_COLOR)
         for ia, ib, ic in boundary:
             pa, pb, pc = pos[ia], pos[ib], pos[ic]
             fn  = np.cross(pb - pa, pc - pa)
@@ -1167,7 +1210,8 @@ class SoftBodyCube:
             if np.dot(fn, mid - gcen) < 0.0:
                 ia, ib, ic = ia, ic, ib
             oriented.append([ia, ib, ic])
-        return oriented
+            colors.append(skin if (is_bnd[ia] and is_bnd[ib] and is_bnd[ic]) else muscle)
+        return oriented, colors
 
     def _rebuild_gpu_arrays(self):
         """Re-upload all GPU arrays from the current Python-side lists.
@@ -1182,7 +1226,7 @@ class SoftBodyCube:
         edge_r = struct_r + [0.0] * len(cohesive_i)
         edge_s = struct_s + [CUT_COHESIVE_STIFFNESS] * len(cohesive_i)
 
-        self._tri_list = self._rebuild_boundary_tris()
+        self._tri_list, self._tri_color_list = self._rebuild_boundary_tris()
 
         n = len(self._pos_list)
         self.num_particles = n
@@ -1211,6 +1255,7 @@ class SoftBodyCube:
         self.corr_count = wp.zeros(n, dtype=wp.int32, device=self.device)
 
         self.tri_indices = np.array(self._tri_list, dtype=np.int32).flatten()
+        self.tri_colors  = np.array(self._tri_color_list, dtype=np.float32)
 
     def teleport(self, delta):
         dx,dy,dz = delta
@@ -1368,6 +1413,8 @@ class WarpSoftBodySim:
                                            # used to clamp per-frame movement
         self._last_tri_count     = 0      # triangle count faceVertexCounts
                                            # was last set for -- see update()
+        self._cube_color_pv      = None   # per-face skin/muscle displayColor
+                                           # primvar handle, created in _spawn()
 
     # ------------------------------------------------------------------
     def load_example_assets(self):
@@ -1437,10 +1484,11 @@ class WarpSoftBodySim:
         # needed here (that was only for the old box-shaped probe).
         self._probe = probe
 
-        # Soft body render mesh (points written each frame)
+        # Soft body render mesh (points written each frame). Color is a
+        # per-face primvar (skin vs. muscle), authored once self._cube
+        # exists -- see _spawn().
         cb = UsdGeom.Mesh.Define(stage, SOFT_BODY_PRIM_PATH)
         cb.CreateDoubleSidedAttr(True)
-        cb.CreateDisplayColorAttr([(0.41, 0.22, 0.16)])  # skin tone
         self._cube_mesh = cb
 
         self._ground = GroundPlane("/World/Ground", visible=False)
@@ -1635,6 +1683,8 @@ class WarpSoftBodySim:
         if num_tris != self._last_tri_count:
             self._cube_mesh.GetFaceVertexCountsAttr().Set(
                 np.full(num_tris, 3, dtype=np.int32).tolist())
+            if self._cube_color_pv is not None:
+                self._cube_color_pv.Set(_vec3f_list(self._cube.tri_colors))
             self._last_tri_count = num_tris
         self._cube_mesh.GetPointsAttr().Set(_vec3f_list(cube_pos_np))
         self._cube_mesh.GetFaceVertexIndicesAttr().Set(
@@ -1665,6 +1715,17 @@ class WarpSoftBodySim:
             self._cube.tri_indices.tolist())
         self._cube_mesh.CreatePointsAttr(
             _vec3f_list(self._cube.pos.numpy()))
+        # Per-face (uniform) display color: skin on the outer surface,
+        # muscle red on any face a cut has exposed. CreatePrimvar is a
+        # no-op if it already exists from a prior spawn (e.g. RESET), so
+        # this is safe to call every time -- only the values change.
+        if self._cube_color_pv is None:
+            self._cube_color_pv = UsdGeom.PrimvarsAPI(
+                self._cube_mesh.GetPrim()
+            ).CreatePrimvar(
+                "displayColor", Sdf.ValueTypeNames.Color3fArray,
+                UsdGeom.Tokens.uniform)
+        self._cube_color_pv.Set(_vec3f_list(self._cube.tri_colors))
         self._last_tri_count = num_tris
 
     def _set_probe_position(self, pos: tuple):
