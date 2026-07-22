@@ -46,20 +46,22 @@ SOFT_RES_Z   = 4    # particles along Z (thin) → spacing = 2*0.01/3 ≈ 6.7 mm
 # Total particles: 10*10*4 = 400
 # Total tets: (9*9*3)*6 = 1458
 
-# Probe — pen-shaped cuboid beside the soft body
-PROBE_HALF_X = 0.005
-PROBE_HALF_Y = 0.005
-PROBE_HALF_Z = 0.005
-PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + PROBE_HALF_Z)
+# Probe — surgical "rod" tool: a thin vertical capsule that hangs above
+# the pad. Touching it deforms the pad (normal collision); dragging it
+# sideways while pressed into the pad advances the cut.
+ROD_RADIUS   = 0.0035    # 3.5mm rod radius
+ROD_LENGTH   = 0.05      # 5cm rod length
+ROD_HALF_LEN = ROD_LENGTH * 0.5
+PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + ROD_LENGTH + 0.01)
 PROBE_COLOR  = np.array([0.75, 0.45, 0.15])
 
 # Keep PIPE_* aliases for gather_colliders compatibility
 PIPE_PRIM_PATH       = PROBE_PRIM_PATH
-PIPE_RADIUS          = max(PROBE_HALF_X, PROBE_HALF_Y)
+PIPE_RADIUS          = ROD_RADIUS
 PIPE_COLLIDE_RADIUS  = PIPE_RADIUS
 PIPE_CENTER          = PROBE_CENTER
-PIPE_AXIS            = (1.0, 1.0, 1.0)
-PIPE_HALF_LEN        = PROBE_HALF_Z
+PIPE_AXIS            = (0.0, 0.0, 1.0)
+PIPE_HALF_LEN        = ROD_HALF_LEN
 
 SKIN = 0.005   # 1 mm collision skin
 
@@ -1088,19 +1090,25 @@ class WarpSoftBodySim:
             "half_z": BASE_HALF_Z,
         }
 
-        # Probe — pen-shaped, kinematic rigid body
-        probe = UsdGeom.Cube.Define(stage, PROBE_PRIM_PATH)
-        probe.CreateSizeAttr(0.5)
+        # Probe — surgical rod: a vertical capsule, kinematic rigid body.
+        # No scale op needed -- radius/height attrs define the capsule
+        # directly, so the only xformOp on this prim we ever author is
+        # translate (rotate/orient ops the viewport gizmo may add are
+        # excluded from the transform order each frame, not zeroed --
+        # see _clear_prim_xform).
+        probe = UsdGeom.Capsule.Define(stage, PROBE_PRIM_PATH)
+        probe.CreateRadiusAttr(ROD_RADIUS)
+        probe.CreateHeightAttr(ROD_LENGTH)
+        probe.CreateAxisAttr(UsdGeom.Tokens.z)
         probe.CreateDisplayColorAttr([Gf.Vec3f(*PROBE_COLOR.tolist())])
         xfp = UsdGeom.Xformable(probe.GetPrim())
         self._probe_translate_op = xfp.AddTranslateOp()
         self._probe_translate_op.Set(Gf.Vec3d(*PROBE_CENTER))
-        xfp.AddScaleOp().Set(Gf.Vec3f(
-            PROBE_HALF_X*2, PROBE_HALF_Y*2, PROBE_HALF_Z*2))
         rba2 = UsdPhysics.RigidBodyAPI.Apply(probe.GetPrim())
         rba2.CreateKinematicEnabledAttr(True)
         UsdPhysics.CollisionAPI.Apply(probe.GetPrim())
-        UsdPhysics.MeshCollisionAPI.Apply(probe.GetPrim()).CreateApproximationAttr("convexHull")
+        # PhysX supports capsules natively -- no convex-hull approximation
+        # needed here (that was only for the old box-shaped probe).
         self._probe = probe
 
         # Soft body render mesh (points written each frame)
@@ -1210,31 +1218,33 @@ class WarpSoftBodySim:
         skip = _OWN_PATHS | {SOFT_BODY_PRIM_PATH, PROBE_PRIM_PATH, BASE_PRIM_PATH}
         colliders = gather_colliders(stage, skip, self._xform_cache)
 
-        # Probe collider from translate op
+        # Probe collider from translate op -- the rod is a vertical
+        # capsule, so its collider is defined by the two endpoints of its
+        # centerline (p0 = top, p1 = bottom tip) rather than a box.
         probe_world = None
+        probe_tip_z = None
         if self._probe is not None:
             p = self._probe_translate_op.Get()
-            probe_world = (float(p[0]), float(p[1]), float(p[2]))
+            cx, cy, cz = float(p[0]), float(p[1]), float(p[2])
+            probe_world = (cx, cy, cz)
+            probe_tip_z = cz - ROD_HALF_LEN   # bottom end -- the working tip
             colliders.append({
-                "shape":  SHAPE_BOX,
-                "center": probe_world,
-                "row0":   Gf.Vec3f(1.0, 0.0, 0.0),
-                "row1":   Gf.Vec3f(0.0, 1.0, 0.0),
-                "row2":   Gf.Vec3f(0.0, 0.0, 1.0),
-                "half_x": float(PROBE_HALF_X),
-                "half_y": float(PROBE_HALF_Y),
-                "half_z": float(PROBE_HALF_Z),
+                "shape":  SHAPE_CAPSULE,
+                "p0":     (cx, cy, cz + ROD_HALF_LEN),
+                "p1":     (cx, cy, probe_tip_z),
+                "radius": float(ROD_RADIUS),
             })
 
-        # ---- Cutting: advance the cut to wherever the probe currently is,
-        # only while the probe is actually pressed into the pad (within its
-        # Y footprint and pushed down to/past its top surface) ----
+        # ---- Cutting: advance the cut to wherever the rod's tip currently
+        # is, only while the tip is actually pressed into the pad (within
+        # its Y footprint and pushed down to/past its top surface). The tip
+        # -- not the rod's center -- is the working end that pokes/cuts. ----
         if probe_world is not None:
-            pwx, pwy, pwz = probe_world
+            pwx, pwy, _ = probe_world
             pad_top_z = SOFT_CENTER[2] + SOFT_HALF_Z
             engaged = (
                 abs(pwy - SOFT_CENTER[1]) < SOFT_HALF_Y
-                and pwz < pad_top_z + SKIN
+                and probe_tip_z < pad_top_z + SKIN
             )
             if engaged:
                 frac = (pwx - (SOFT_CENTER[0] - SOFT_HALF_X)) / (2 * SOFT_HALF_X)
@@ -1332,47 +1342,32 @@ class WarpSoftBodySim:
             return None
 
     def _clear_prim_xform(self, prim_path):
+        """Force the prim's applied transform down to just its translate
+        op. Rotate/orient ops the viewport gizmo adds are EXCLUDED from
+        the xformOpOrder rather than reset in place.
+
+        Resetting them in place requires matching their exact value type
+        and precision (GfVec3f vs GfVec3d, GfQuatf vs GfQuatd, etc) --
+        which is exactly what kept breaking here: whatever type Kit
+        happened to create the op as, our hardcoded reset value didn't
+        match, and an uncaught type-mismatch exception killed the entire
+        frame (physics step and mesh update included) before it could run.
+        Dropping those ops from the order sidesteps the type question
+        completely -- they simply stop contributing to the transform.
+        """
         stage = omni.usd.get_context().get_stage()
         if stage is None: return
         prim = stage.GetPrimAtPath(prim_path)
         if not prim.IsValid(): return
-        for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
-            try:
-                t = op.GetOpType()
-                # IMPORTANT: match the op's own precision. Ops we create
-                # ourselves default to double, but Kit's viewport gizmo
-                # (move/rotate tool) can add ops -- e.g. xformOp:orient --
-                # typed as single-precision (GfQuatf/GfVec3f). Setting a
-                # double-precision value on a float-precision op raises a
-                # Tf.ErrorException that, if uncaught, aborts the entire
-                # update() call before it ever reaches the physics step --
-                # which looks like "the sim just stopped simulating".
-                precision = op.GetPrecision()
-                if t == UsdGeom.XformOp.TypeTranslate:
-                    if precision == UsdGeom.XformOp.PrecisionFloat:
-                        op.Set(Gf.Vec3f(0, 0, 0))
-                    elif precision == UsdGeom.XformOp.PrecisionHalf:
-                        op.Set(Gf.Vec3h(0, 0, 0))
-                    else:
-                        op.Set(Gf.Vec3d(0, 0, 0))
-                elif t == UsdGeom.XformOp.TypeRotateXYZ:
-                    if precision == UsdGeom.XformOp.PrecisionDouble:
-                        op.Set(Gf.Vec3d(0, 0, 0))
-                    elif precision == UsdGeom.XformOp.PrecisionHalf:
-                        op.Set(Gf.Vec3h(0, 0, 0))
-                    else:
-                        op.Set(Gf.Vec3f(0, 0, 0))
-                elif t == UsdGeom.XformOp.TypeOrient:
-                    if precision == UsdGeom.XformOp.PrecisionDouble:
-                        op.Set(Gf.Quatd(1, 0, 0, 0))
-                    elif precision == UsdGeom.XformOp.PrecisionHalf:
-                        op.Set(Gf.Quath(1, 0, 0, 0))
-                    else:
-                        op.Set(Gf.Quatf(1, 0, 0, 0))
-                # scale: never zero
-            except Exception as e:
-                # Never let a single op's type quirk abort the whole frame
-                # (and with it, the physics step and mesh update below it).
-                carb.log_warn(
-                    f"[WarpSoftBody] failed to clear xformOp "
-                    f"{op.GetOpName()} on {prim_path}: {e}")
+        try:
+            xformable = UsdGeom.Xformable(prim)
+            translate_op = None
+            for op in xformable.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                    translate_op = op
+                    break
+            if translate_op is not None:
+                xformable.SetXformOpOrder([translate_op])
+        except Exception as e:
+            carb.log_warn(f"[WarpSoftBody] failed to reset xform order on "
+                           f"{prim_path}: {e}")
