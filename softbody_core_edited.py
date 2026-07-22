@@ -348,6 +348,78 @@ def collide_cylinder(
         if vn < 0.0: vel[tid] = v - n * (vn * (1.0 - friction))
 
 
+@wp.kernel
+def collide_capsule(
+    pred:     wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=wp.float32),
+    vel:      wp.array(dtype=wp.vec3),
+    p0:       wp.vec3,   # one end of the capsule's centerline segment
+    p1:       wp.vec3,   # other end
+    radius:   wp.float32,
+    skin:     wp.float32,
+    friction: wp.float32,
+):
+    tid = wp.tid()
+    if inv_mass[tid] == 0.0:
+        return
+    p        = pred[tid]
+    seg      = p1 - p0
+    seg_len2 = wp.dot(seg, seg)
+    if seg_len2 < 1.0e-12:
+        closest = p0
+    else:
+        t = wp.dot(p - p0, seg) / seg_len2
+        t = wp.clamp(t, 0.0, 1.0)
+        closest = p0 + seg * t
+    diff = p - closest
+    dist = wp.length(diff)
+    lim  = radius + skin
+    if dist < lim and dist > 1.0e-6:
+        n = diff / dist
+        pred[tid] = closest + n * lim
+        v  = vel[tid]
+        vn = wp.dot(v, n)
+        if vn < 0.0:
+            vel[tid] = v - n * (vn * (1.0 - friction))
+
+
+@wp.kernel
+def collide_cone(
+    pred:       wp.array(dtype=wp.vec3),
+    inv_mass:   wp.array(dtype=wp.float32),
+    vel:        wp.array(dtype=wp.vec3),
+    apex:       wp.vec3,
+    axis:       wp.vec3,   # unit vector, apex -> base
+    half_angle: wp.float32,
+    height:     wp.float32,
+    skin:       wp.float32,
+    friction:   wp.float32,
+):
+    tid = wp.tid()
+    if inv_mass[tid] == 0.0:
+        return
+    p = pred[tid]
+    v = p - apex
+    h = wp.dot(v, axis)
+    if h < -skin or h > height + skin:
+        return
+    h_c    = wp.clamp(h, 0.0, height)
+    radial = v - axis * h
+    dist   = wp.length(radial)
+    r_at_h = h_c * wp.tan(half_angle)
+    lim    = r_at_h + skin
+    if dist < lim:
+        if dist > 1.0e-6:
+            n = radial / dist
+        else:
+            n = wp.vec3(1.0, 0.0, 0.0)
+        pred[tid] = apex + axis * h_c + n * lim
+        vv = vel[tid]
+        vn = wp.dot(vv, n)
+        if vn < 0.0:
+            vel[tid] = vv - n * (vn * (1.0 - friction))
+
+
 
 
 @wp.kernel
