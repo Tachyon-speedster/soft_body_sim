@@ -944,8 +944,14 @@ class SoftBodyCube:
             return set()
 
         # Oversample well past one sample per cell so a fast single-frame
-        # drag can't jump clean over a cell boundary without registering it.
-        steps = max(1, int(math.ceil(dist * 6.0)))
+        # drag can't jump clean over a cell boundary without registering
+        # it. Bumped from 6x to 12x per grid unit: at 6x, a fast or
+        # diagonal single-frame drag could still land its samples on the
+        # "wrong side" of a wall crossing often enough to produce a
+        # visibly jagged/stair-stepped cut line; 12x tracks the tip's
+        # true path much more closely without meaningfully increasing
+        # cost (this loop is pure Python-side bookkeeping, not physics).
+        steps = max(1, int(math.ceil(dist * 12.0)))
         touched = set()
         prev_fx, prev_fy = fx0, fy0
         for s in range(1, steps + 1):
@@ -1360,6 +1366,8 @@ class WarpSoftBodySim:
         self._xform_cache        = None
         self._probe_last_good    = None   # last accepted probe world pos,
                                            # used to clamp per-frame movement
+        self._last_tri_count     = 0      # triangle count faceVertexCounts
+                                           # was last set for -- see update()
 
     # ------------------------------------------------------------------
     def load_example_assets(self):
@@ -1596,9 +1604,19 @@ class WarpSoftBodySim:
         self._cube._check_cohesive_breaks()
 
         # Write positions to USD render mesh. Face-vertex INDICES are
-        # re-set every frame too (not just at spawn) -- cutting doesn't
-        # change how many triangles there are, but it does change which
-        # vertices they point to, and the point buffer itself can grow.
+        # re-set every frame too (not just at spawn) -- and, critically,
+        # so is faceVertexCounts. Cutting DOES change how many triangles
+        # exist: severing a wall splits a grid vertex into two duplicate
+        # particle columns, which turns previously-internal faces (shared
+        # by two tets, so not boundary) into faces that are now only
+        # claimed by one tet on each side -- i.e. new boundary faces
+        # appear on both sides of the cut, so the triangle count goes UP.
+        # If faceVertexCounts is left stale (its length no longer matches
+        # how faceVertexIndices actually chunks into triangles), USD sees
+        # an inconsistent mesh and Hydra culls/hides it outright -- this
+        # was the "mesh deletes itself while cutting" bug. Recomputing it
+        # whenever the triangle count changes keeps the two attributes
+        # consistent no matter how topology changed this step.
         #
         # Safety net: if the solver ever blows up (NaN/Inf positions, from
         # any cause), do NOT push that into the renderer -- a degenerate
@@ -1612,9 +1630,15 @@ class WarpSoftBodySim:
                 "skipping this frame's mesh update to avoid handing the "
                 "renderer a degenerate mesh.")
             return False
+        tri_indices = self._cube.tri_indices
+        num_tris = len(tri_indices) // 3
+        if num_tris != self._last_tri_count:
+            self._cube_mesh.GetFaceVertexCountsAttr().Set(
+                np.full(num_tris, 3, dtype=np.int32).tolist())
+            self._last_tri_count = num_tris
         self._cube_mesh.GetPointsAttr().Set(_vec3f_list(cube_pos_np))
         self._cube_mesh.GetFaceVertexIndicesAttr().Set(
-            self._cube.tri_indices.tolist())
+            tri_indices.tolist())
         return False
 
     # ------------------------------------------------------------------
@@ -1634,12 +1658,14 @@ class WarpSoftBodySim:
             k_vol=0.6,
             device=self._device,
         )
-        fc = np.full(len(self._cube.tri_indices)//3, 3, dtype=np.int32)
+        num_tris = len(self._cube.tri_indices) // 3
+        fc = np.full(num_tris, 3, dtype=np.int32)
         self._cube_mesh.CreateFaceVertexCountsAttr(fc.tolist())
         self._cube_mesh.CreateFaceVertexIndicesAttr(
             self._cube.tri_indices.tolist())
         self._cube_mesh.CreatePointsAttr(
             _vec3f_list(self._cube.pos.numpy()))
+        self._last_tri_count = num_tris
 
     def _set_probe_position(self, pos: tuple):
         if self._probe is None: return
