@@ -668,21 +668,45 @@ class SoftBodyCube:
         # Stored for cutting: column-based indexing needs the grid shape
         # and per-particle mass (new duplicated particles need a mass too).
         self.res_x, self.res_y, self.res_z = res_x, res_y, res_z
-        self.center = (cx, cy, cz)
-        self.half_x, self.half_y, self.half_z = half_x, half_y, half_z
         self.n_orig = n
         self._total_mass = total_mass
         self._k_edge = k_edge
         self._k_vol = k_vol
-        self.cut_map = {}               # (axis, boundary, other, iz) -> dup index
-                                          # tracks which LOCAL interface points
-                                          # have already been cut, so cutting
-                                          # follows the tool's actual path
-                                          # instead of slicing a whole
-                                          # cross-section at once
-        self.cohesive = []              # list of dicts: {a, b, spring_idx}
-                                          # tracking each cut interface pair
-                                          # still bonded, for break-checking
+
+        # Geometry, kept around so world-space probe coordinates can be
+        # converted into grid space for cutting.
+        self.center = (cx, cy, cz)
+        self.half_x, self.half_y, self.half_z = half_x, half_y, half_z
+
+        # ── Cutting state ───────────────────────────────────────────────
+        # Cuts are tracked as a set of severed "walls" -- the shared faces
+        # between adjacent grid cells in the XY plane (a wall always spans
+        # the full Z thickness, since the probe is a vertical rod). This
+        # replaces the old single "cut_progress" column index, which could
+        # only ever sever one full X-column (Y and Z, entirely) at a time.
+        #
+        # _severed_x[(ix, cy)]: the wall between cell (ix-1, cy) and cell
+        #   (ix, cy) is cut (a "vertical" wall, crossed when the probe
+        #   moves in +/-X).
+        # _severed_y[(cx, iy)]: the wall between cell (cx, iy-1) and cell
+        #   (cx, iy) is cut (a "horizontal" wall, crossed when the probe
+        #   moves in +/-Y).
+        # Together these support a cut path in ANY direction, and only
+        # ever affect the specific cells the probe actually swept through.
+        self._severed_x = set()
+        self._severed_y = set()
+
+        # _vertex_groups[(vx, vy)]: maps each of the (up to 4) grid cells
+        # touching vertex column (vx, vy) to the particle-column "base" id
+        # it currently uses there. Lazily populated the first time a
+        # vertex is touched by a cut; every entry starts out pointing at
+        # the single original base id (i.e. everything still connected).
+        self._vertex_groups = {}
+
+        self.cohesive = []              # list of dicts: {a, b} -- pairs of
+                                          # particle-column bases straddling
+                                          # a cut interface, still bonded by
+                                          # a breakable constraint
 
         # ── Particle grid ────────────────────────────────────────────────
         lx = np.linspace(-half_x, half_x, res_x, dtype=np.float64) + cx
@@ -704,7 +728,19 @@ class SoftBodyCube:
                 inv_mass[vidx(ix, iy, 0)] = 0.0
 
         # ── Tetrahedralization (Freudenthal 6-tet split) ─────────────────
+        # tet_cell[ti]    = (ix, iy) the XY cell this tet belongs to (its Z
+        #                   layer doesn't matter for cutting -- a cut wall
+        #                   always spans the full thickness).
+        # tet_corners[ti] = the ORIGINAL (ix, iy, iz) grid coordinate of
+        #                   each of the tet's 4 corners. These labels never
+        #                   change even after a corner gets retargeted to a
+        #                   duplicate particle id -- they're what let a cut
+        #                   find "every tet corner currently at grid vertex
+        #                   (vx, vy)" without needing to reverse-engineer
+        #                   it from whatever id happens to be there now.
         tets = []
+        tet_cell = []
+        tet_corners = []
         for ix in range(res_x - 1):
             for iy in range(res_y - 1):
                 for iz in range(res_z - 1):
@@ -712,7 +748,11 @@ class SoftBodyCube:
                     v010=vidx(ix,  iy+1,iz  ); v110=vidx(ix+1,iy+1,iz  )
                     v001=vidx(ix,  iy,  iz+1); v101=vidx(ix+1,iy,  iz+1)
                     v011=vidx(ix,  iy+1,iz+1); v111=vidx(ix+1,iy+1,iz+1)
-                    tets += [
+                    c000=(ix,iy,iz);     c100=(ix+1,iy,iz)
+                    c010=(ix,iy+1,iz);   c110=(ix+1,iy+1,iz)
+                    c001=(ix,iy,iz+1);   c101=(ix+1,iy,iz+1)
+                    c011=(ix,iy+1,iz+1); c111=(ix+1,iy+1,iz+1)
+                    cell_tets = [
                         (v000,v100,v110,v111),
                         (v000,v100,v101,v111),
                         (v000,v010,v110,v111),
@@ -720,6 +760,17 @@ class SoftBodyCube:
                         (v000,v001,v101,v111),
                         (v000,v001,v011,v111),
                     ]
+                    cell_corners = [
+                        (c000,c100,c110,c111),
+                        (c000,c100,c101,c111),
+                        (c000,c010,c110,c111),
+                        (c000,c010,c011,c111),
+                        (c000,c001,c101,c111),
+                        (c000,c001,c011,c111),
+                    ]
+                    tets += cell_tets
+                    tet_corners += cell_corners
+                    tet_cell += [(ix, iy)] * 6
         tets = np.array(tets, dtype=np.int64)
 
         # Ensure positive volume
@@ -730,9 +781,17 @@ class SoftBodyCube:
         flip = vols < 0
         if flip.any():
             tets[flip,0], tets[flip,1] = tets[flip,1].copy(), tets[flip,0].copy()
+            for ti in np.nonzero(flip)[0]:
+                tc = tet_corners[int(ti)]
+                tet_corners[int(ti)] = (tc[1], tc[0], tc[2], tc[3])
             vols = tet_vol(positions, tets)
 
         self.num_tets = len(tets)
+        self._tet_cell = tet_cell               # list[(ix, iy)], len == num_tets
+        self._tet_corners = tet_corners          # list[4 x (ix,iy,iz)], len == num_tets
+        self._tets_by_cell = {}
+        for ti, c in enumerate(tet_cell):
+            self._tets_by_cell.setdefault(c, []).append(ti)
 
         # ── Unique tet edges → distance constraints ───────────────────────
         edge_set = set()
@@ -794,12 +853,15 @@ class SoftBodyCube:
         # constraints, so we keep growable Python lists here and rebuild
         # the GPU arrays from them whenever topology changes)
         self._pos_list      = pos32.tolist()
+        self._vel_list      = [[0.0, 0.0, 0.0]] * n
+        self._rest_pos_list = pos32.tolist()   # undeformed positions; only
+                                                 # ever grows (duplicates
+                                                 # copy their origin's rest
+                                                 # position) -- used so cut
+                                                 # springs get correct rest
+                                                 # lengths, not strained ones
         self._inv_mass_list = inv_mass.tolist()
         self._tets_list     = tets.tolist()
-        self._edge_i_list   = si.tolist()
-        self._edge_j_list   = sj.tolist()
-        self._edge_rest_list  = sr.tolist()
-        self._edge_stiff_list = sk.tolist()
         self._tet_vol_list   = vols.astype(np.float32).tolist()
         self._tet_stiff_list = [float(k_vol)] * self.num_tets
         self._tri_list       = [list(t) for t in oriented]
@@ -809,141 +871,230 @@ class SoftBodyCube:
         return float(c[0]), float(c[1]), float(c[2])
 
     # ------------------------------------------------------------------
-    # Cutting: virtual-node duplication along constant-X columns, with a
-    # breakable cohesive constraint at each duplicated interface.
+    # Cutting: local wall severing + per-vertex group splitting.
     #
-    # This is the same algorithm validated in isolation (small tet-grid
-    # test) before being wired in here: a tet/edge/triangle belongs to the
-    # "far" side of a cut at column `ix` if its minimum column index is
-    # exactly `ix` (the cell block starting at that column); only THAT
-    # element's vertices at column `ix` get retargeted to the duplicate,
-    # not the whole element.
+    # The XY footprint is a grid of (res_x-1) x (res_y-1) cells. Every pair
+    # of adjacent cells shares a "wall" (spanning the full Z thickness,
+    # since the probe is a vertical rod). Dragging the probe through the
+    # pad severs exactly the walls it actually crosses -- nothing else --
+    # so a cut can run in any direction (not just along X), can curve, can
+    # be applied piecemeal without racing ahead to fill in a whole column,
+    # and never affects material the probe didn't actually pass through.
+    #
+    # At any grid vertex touched by a severed wall, the (up to 4) cells
+    # that meet there are grouped by whichever ones are still connected
+    # through an un-severed wall. If that grouping is finer than before,
+    # the newly-separated group gets a fresh duplicate particle column
+    # (copied from wherever the original currently sits, then linked back
+    # to it with a breakable cohesive constraint) while the rest of the
+    # material keeps using the id it already had -- so already-separated
+    # material is never reset or "un-cut" by a later cut elsewhere.
     # ------------------------------------------------------------------
     def _vidx(self, ix, iy, iz):
         return ix * self.res_y * self.res_z + iy * self.res_z + iz
 
-    def _column_of(self, v):
-        """Column index for an ORIGINAL vertex only (v < n_orig).
-        Duplicated vertices don't have a meaningful column -- callers
-        must check v < self.n_orig before calling this."""
-        return v // (self.res_y * self.res_z)
+    def _world_to_grid_xy(self, x, y):
+        """World (x, y) -> continuous grid-vertex coordinates, i.e. the
+        same space column indices (ix, iy) live in (0 .. res-1)."""
+        fx = (x - (self.center[0] - self.half_x)) / (2.0 * self.half_x) * (self.res_x - 1)
+        fy = (y - (self.center[1] - self.half_y)) / (2.0 * self.half_y) * (self.res_y - 1)
+        return fx, fy
 
-    def _grid_of(self, v):
-        """(ix,iy,iz) for an ORIGINAL vertex only (v < n_orig)."""
-        iz = v % self.res_z
-        iy = (v // self.res_z) % self.res_y
-        ix = v // (self.res_y * self.res_z)
-        return ix, iy, iz
+    def cut_segment(self, x0, y0, x1, y1):
+        """Sever every cell wall the straight line from (x0,y0) to
+        (x1,y1) (world-space) actually crosses, then locally re-split
+        only the grid vertices touched by those new walls. No-op if the
+        segment doesn't leave its starting cell."""
+        fx0, fy0 = self._world_to_grid_xy(x0, y0)
+        fx1, fy1 = self._world_to_grid_xy(x1, y1)
+        touched = self._walk_and_sever(fx0, fy0, fx1, fy1)
+        if not touched:
+            return
 
-    def cut_near(self, world_x, world_y, world_z, cut_radius=1.2):
-        """Localized, multi-directional cutting: sever material only in a
-        small neighborhood of wherever the tool currently is, along
-        whichever grid axis (X or Y) the tool is currently closest to a
-        boundary of. Dragging the tool along ANY path -- straight, curved,
-        any direction -- traces out a cut that follows that path, since
-        each frame only cuts the local interface point nearest the tool,
-        not an entire column/row cross-section at once.
+        self._sync_from_gpu()
+        changed = False
+        for (vx, vy) in touched:
+            if self._retarget_vertex(vx, vy):
+                changed = True
+        if changed:
+            self._rebuild_gpu_arrays()
 
-        cut_radius is in GRID CELLS (not meters) -- how wide a neighborhood
-        around the tool gets cut at once. ~1-1.5 gives a clean, tool-width
-        incision at this mesh resolution; raise it for a wider cut swath.
+    def _walk_and_sever(self, fx0, fy0, fx1, fy1):
+        """March along the segment in grid-vertex space, severing the
+        walls it actually cuts through. Returns the set of grid vertices
+        adjacent to any NEWLY severed wall (the vertices that need
+        re-splitting), or an empty set if nothing new was cut.
+
+        Wall orientation is the subtle part: a probe advancing along X
+        must sever the walls that separate ROWS (Y-walls) -- so the
+        result is a cut that runs alongside its own path, splitting
+        whatever is above the path from whatever is below it -- exactly
+        like dragging a blade left-to-right leaves a cut that separates
+        top from bottom, not a cut that chops the row it's in into
+        disconnected pieces. Symmetrically, advancing along Y severs
+        X-walls, splitting left from right. A locally-diagonal step
+        severs both, approximating a diagonal cut against the grid.
         """
-        # world position -> grid-fractional coordinates
-        fx = (world_x - (self.center[0] - self.half_x)) / (2 * self.half_x) * (self.res_x - 1)
-        fy = (world_y - (self.center[1] - self.half_y)) / (2 * self.half_y) * (self.res_y - 1)
-        fz = (world_z - (self.center[2] - self.half_z)) / (2 * self.half_z) * (self.res_z - 1)
+        max_ix, max_iy = self.res_x - 1, self.res_y - 1
+        fx0 = max(0.0, min(max_ix, fx0)); fy0 = max(0.0, min(max_iy, fy0))
+        fx1 = max(0.0, min(max_ix, fx1)); fy1 = max(0.0, min(max_iy, fy1))
+        dx, dy = fx1 - fx0, fy1 - fy0
+        dist = math.hypot(dx, dy)
+        if dist < 1.0e-6:
+            return set()
 
-        bx = int(round(fx)); bx = max(1, min(self.res_x - 2, bx))
-        by = int(round(fy)); by = max(1, min(self.res_y - 2, by))
-        dist_x_wall = abs(fx - bx)
-        dist_y_wall = abs(fy - by)
-        axis, b = ('x', bx) if dist_x_wall <= dist_y_wall else ('y', by)
+        # Oversample well past one sample per cell so a fast single-frame
+        # drag can't jump clean over a cell boundary without registering it.
+        steps = max(1, int(math.ceil(dist * 6.0)))
+        touched = set()
+        prev_fx, prev_fy = fx0, fy0
+        for s in range(1, steps + 1):
+            t = s / steps
+            fx = fx0 + dx * t
+            fy = fy0 + dy * t
+            step_dx = fx - prev_fx
+            step_dy = fy - prev_fy
+            mx = (prev_fx + fx) * 0.5
+            my = (prev_fy + fy) * 0.5
+            cx = max(0, min(self.res_x - 2, int(math.floor(mx))))
+            cy = max(0, min(self.res_y - 2, int(math.floor(my))))
+            rx = int(round(mx))
+            ry = int(round(my))
 
-        # Sync current simulated state from the GPU before mutating topology
-        cur_pos = self.pos.numpy()
-        cur_vel = self.vel.numpy()
-        self._pos_list = cur_pos.tolist()
-        vel_list = cur_vel.tolist()
-        while len(vel_list) < len(self._pos_list):
-            vel_list.append([0.0, 0.0, 0.0])
+            if abs(step_dx) >= abs(step_dy):
+                # advancing through column cx -- sever the row-wall
+                # nearest to where it's currently passing through
+                if 1 <= ry <= self.res_y - 2:
+                    key = (cx, ry)
+                    if key not in self._severed_y:
+                        self._severed_y.add(key)
+                        touched.add((cx, ry)); touched.add((cx + 1, ry))
+            if abs(step_dy) >= abs(step_dx):
+                # advancing through row cy -- sever the column-wall
+                # nearest to where it's currently passing through
+                if 1 <= rx <= self.res_x - 2:
+                    key = (rx, cy)
+                    if key not in self._severed_x:
+                        self._severed_x.add(key)
+                        touched.add((rx, cy)); touched.add((rx, cy + 1))
 
-        cut_something = False
-        if axis == 'x':
-            for iy in range(self.res_y):
-                for iz in range(self.res_z):
-                    if abs(iy - fy) > cut_radius or abs(iz - fz) > cut_radius:
-                        continue
-                    key = ('x', b, iy, iz)
-                    if key in self.cut_map:
-                        continue
-                    self._duplicate_local('x', b, iy, iz, vel_list)
-                    cut_something = True
-        else:
-            for ix in range(self.res_x):
-                for iz in range(self.res_z):
-                    if abs(ix - fx) > cut_radius or abs(iz - fz) > cut_radius:
-                        continue
-                    key = ('y', b, ix, iz)
-                    if key in self.cut_map:
-                        continue
-                    self._duplicate_local('y', b, ix, iz, vel_list)
-                    cut_something = True
+            prev_fx, prev_fy = fx, fy
+        return touched
 
-        if cut_something:
-            self._rebuild_gpu_arrays(vel_list)
-        return cut_something
+    def _retarget_vertex(self, vx, vy):
+        """Re-evaluate how many disconnected groups the (up to 4) cells
+        touching grid vertex (vx, vy) currently form, given every severed
+        wall so far. Allocates new duplicate particle columns for any
+        newly-separated group and retargets the corner of every affected
+        tet. Returns True if anything actually changed."""
+        cells = [c for c in ((vx-1,vy-1), (vx,vy-1), (vx-1,vy), (vx,vy))
+                 if 0 <= c[0] <= self.res_x - 2 and 0 <= c[1] <= self.res_y - 2]
+        if len(cells) <= 1:
+            return False   # only one owner -- nothing to ever split here
 
-    def _duplicate_local(self, axis, b, other1, iz, vel_list):
-        """Duplicate exactly ONE local interface vertex and retarget only
-        the tets/edges/triangles that reference it AND are on the far
-        side of the cut -- this locality (only elements touching this
-        specific vertex) is what keeps the cut confined to the tool's
-        actual neighborhood instead of spreading across the whole mesh."""
-        v = self._vidx(b, other1, iz) if axis == 'x' else self._vidx(other1, b, iz)
-        n_orig = self.n_orig
+        key = (vx, vy)
+        if key not in self._vertex_groups:
+            base0 = self._vidx(vx, vy, 0)
+            self._vertex_groups[key] = {c: base0 for c in cells}
+        old_map = self._vertex_groups[key]
 
-        dup_i = len(self._pos_list)
-        self._pos_list.append(list(self._pos_list[v]))
-        vel_list.append(list(vel_list[v]))
-        self._inv_mass_list.append(self._inv_mass_list[v])
-        self.cut_map[(axis, b, other1, iz)] = dup_i
+        # Union-Find over the incident cells, connected unless the wall
+        # directly between them has been severed.
+        parent = {c: c for c in cells}
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
 
-        spring_idx = len(self._edge_i_list)
-        self._edge_i_list.append(v)
-        self._edge_j_list.append(dup_i)
-        self._edge_rest_list.append(0.0)
-        self._edge_stiff_list.append(CUT_COHESIVE_STIFFNESS)
-        self.cohesive.append({"a": v, "b": dup_i, "spring_idx": spring_idx})
+        c00, c10, c01, c11 = (vx-1,vy-1), (vx,vy-1), (vx-1,vy), (vx,vy)
+        cell_set = set(cells)
+        for a, b, severed_set, wall_key in (
+            (c00, c10, self._severed_x, (vx, vy - 1)),   # x-wall, row vy-1
+            (c01, c11, self._severed_x, (vx, vy)),       # x-wall, row vy
+            (c00, c01, self._severed_y, (vx - 1, vy)),   # y-wall, col vx-1
+            (c10, c11, self._severed_y, (vx, vy)),       # y-wall, col vx
+        ):
+            if a in cell_set and b in cell_set and wall_key not in severed_set:
+                union(a, b)
 
-        def col_of(vert):
-            gix, giy, _ = self._grid_of(vert)
-            return gix if axis == 'x' else giy
+        groups = {}
+        for c in cells:
+            groups.setdefault(find(c), []).append(c)
+        new_groups = list(groups.values())
 
-        for ti in range(len(self._tets_list)):
-            tet = self._tets_list[ti]
-            if v not in tet:
-                continue
-            if any(tv >= n_orig for tv in tet):
-                continue
-            if min(col_of(tv) for tv in tet) == b:
-                self._tets_list[ti] = [dup_i if tv == v else tv for tv in tet]
+        old_groups = {}
+        for c, base in old_map.items():
+            old_groups.setdefault(base, []).append(c)
+        old_partition = {frozenset(g) for g in old_groups.values()}
+        new_partition = {frozenset(g) for g in new_groups}
+        if new_partition == old_partition:
+            return False   # this vertex wasn't actually split any further
 
-        for ei in range(len(self._edge_i_list) - 1):  # -1 skips the cohesive spring just appended
-            i_, j_ = self._edge_i_list[ei], self._edge_j_list[ei]
-            if i_ >= n_orig or j_ >= n_orig or (i_ != v and j_ != v):
-                continue
-            if min(col_of(i_), col_of(j_)) == b:
-                if i_ == v: self._edge_i_list[ei] = dup_i
-                if j_ == v: self._edge_j_list[ei] = dup_i
+        new_map = {}
+        used_old_bases = set()
+        changed = False
+        for group in new_groups:
+            old_bases_here = {old_map[c] for c in group}
+            if len(old_bases_here) == 1 and next(iter(old_bases_here)) not in used_old_bases:
+                base = next(iter(old_bases_here))
+                used_old_bases.add(base)
+            else:
+                # Either this group mixes cells that used to be in different
+                # groups (shouldn't happen -- walls only get added, groups
+                # only ever get finer), or its old base was already claimed
+                # by another sub-group this pass. Either way it's a fresh
+                # split-off piece: give it its own duplicate column.
+                src_base = old_map[group[0]]
+                base = self._alloc_duplicate_column(src_base)
+                changed = True
+            for c in group:
+                new_map[c] = base
 
-        for fi in range(len(self._tri_list)):
-            tri = self._tri_list[fi]
-            if v not in tri:
-                continue
-            if any(tv >= n_orig for tv in tri):
-                continue
-            if min(col_of(tv) for tv in tri) == b:
-                self._tri_list[fi] = [dup_i if tv == v else tv for tv in tri]
+        self._vertex_groups[key] = new_map
+
+        if changed or new_map != old_map:
+            changed = True
+            for c, base in new_map.items():
+                if old_map.get(c) != base:
+                    for ti in self._tets_by_cell.get(c, []):
+                        self._retarget_tet_corner(ti, vx, vy, base)
+        return changed
+
+    def _retarget_tet_corner(self, ti, vx, vy, new_base):
+        corners = self._tet_corners[ti]
+        tet = self._tets_list[ti]
+        for slot in range(4):
+            ix, iy, iz = corners[slot]
+            if ix == vx and iy == vy:
+                tet[slot] = new_base + iz
+
+    def _alloc_duplicate_column(self, src_base):
+        """Append a fresh res_z-particle column, copied from src_base's
+        current position/velocity/mass, and bond it back with a breakable
+        cohesive constraint. Returns the new column's base id."""
+        new_base = len(self._pos_list)
+        for iz in range(self.res_z):
+            src = src_base + iz
+            self._pos_list.append(list(self._pos_list[src]))
+            self._vel_list.append(list(self._vel_list[src]))
+            self._inv_mass_list.append(self._inv_mass_list[src])
+            self._rest_pos_list.append(list(self._rest_pos_list[src]))
+        self.cohesive.append({"a": src_base, "b": new_base})
+        return new_base
+
+    def _sync_from_gpu(self):
+        """Pull current simulated position/velocity down from the GPU
+        before mutating topology -- self._pos_list/_vel_list are only
+        touched here and in _alloc_duplicate_column, so without this sync
+        any rebuild would silently snap particles back to wherever they
+        were as of the LAST topology change."""
+        self._pos_list = self.pos.numpy().tolist()
+        self._vel_list = self.vel.numpy().tolist()
 
     def _check_cohesive_breaks(self):
         """Check all still-bonded cut interfaces; remove any that have
@@ -953,50 +1104,97 @@ class SoftBodyCube:
             return
         pos_np = self.pos.numpy()
         still_bonded = []
-        broken_spring_idxs = set()
+        broke = False
         for c in self.cohesive:
             dist = float(np.linalg.norm(pos_np[c["a"]] - pos_np[c["b"]]))
             if dist >= CUT_DELTA_C:
-                broken_spring_idxs.add(c["spring_idx"])
+                broke = True
             else:
                 still_bonded.append(c)
-
-        if not broken_spring_idxs:
+        if not broke:
             return
-
         self.cohesive = still_bonded
-        keep = [i for i in range(len(self._edge_i_list)) if i not in broken_spring_idxs]
-        self._edge_i_list     = [self._edge_i_list[i] for i in keep]
-        self._edge_j_list     = [self._edge_j_list[i] for i in keep]
-        self._edge_rest_list  = [self._edge_rest_list[i] for i in keep]
-        self._edge_stiff_list = [self._edge_stiff_list[i] for i in keep]
-        # cohesive spring_idx values are now stale -- remap them
-        remap = {old_i: new_i for new_i, old_i in enumerate(keep)}
-        for c in self.cohesive:
-            c["spring_idx"] = remap[c["spring_idx"]]
+        self._sync_from_gpu()
+        self._rebuild_gpu_arrays()
 
-        self._rebuild_gpu_arrays(self.vel.numpy().tolist())
+    def _rebuild_structural_edges(self):
+        """Recompute the tet-edge distance constraints from scratch from
+        the CURRENT self._tets_list. Simpler and more robust than trying
+        to incrementally patch an edge list: whichever tets a cut just
+        retargeted onto different particle ids will naturally stop sharing
+        an edge with their old neighbors here, with no extra bookkeeping."""
+        edge_set = set()
+        for tet in self._tets_list:
+            for a, b in ((0,1),(0,2),(0,3),(1,2),(1,3),(2,3)):
+                i, j = tet[a], tet[b]
+                if i > j: i, j = j, i
+                edge_set.add((i, j))
+        rp = self._rest_pos_list
+        ei, ej, er, es = [], [], [], []
+        for i, j in edge_set:
+            ei.append(i); ej.append(j)
+            dx = rp[i][0]-rp[j][0]; dy = rp[i][1]-rp[j][1]; dz = rp[i][2]-rp[j][2]
+            er.append(math.sqrt(dx*dx + dy*dy + dz*dz))
+            es.append(self._k_edge)
+        return ei, ej, er, es
 
-    def _rebuild_gpu_arrays(self, vel_list):
+    def _rebuild_boundary_tris(self):
+        """Recompute the render-mesh boundary faces from scratch from the
+        current self._tets_list (a face belongs to exactly one tet)."""
+        tet_faces = [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
+        fc, fw = {}, {}
+        for tet in self._tets_list:
+            for fa, fb, fcx in tet_faces:
+                ia, ib, ic = tet[fa], tet[fb], tet[fcx]
+                key = tuple(sorted((ia, ib, ic)))
+                fc[key] = fc.get(key, 0) + 1
+                if key not in fw:
+                    fw[key] = (ia, ib, ic)
+        boundary = [fw[k] for k, v in fc.items() if v == 1]
+        pos = np.array(self._pos_list, dtype=np.float32)
+        gcen = pos.mean(0)
+        oriented = []
+        for ia, ib, ic in boundary:
+            pa, pb, pc = pos[ia], pos[ib], pos[ic]
+            fn  = np.cross(pb - pa, pc - pa)
+            mid = (pa + pb + pc) / 3.0
+            if np.dot(fn, mid - gcen) < 0.0:
+                ia, ib, ic = ia, ic, ib
+            oriented.append([ia, ib, ic])
+        return oriented
+
+    def _rebuild_gpu_arrays(self):
         """Re-upload all GPU arrays from the current Python-side lists.
-        Called after advance_cut() or a cohesive break changes topology."""
+        Called after cut_segment() or a cohesive break changes topology.
+        Assumes self._pos_list / self._vel_list are already current (via
+        _sync_from_gpu, plus any new columns appended on top)."""
+        struct_i, struct_j, struct_r, struct_s = self._rebuild_structural_edges()
+        cohesive_i = [c["a"] for c in self.cohesive]
+        cohesive_j = [c["b"] for c in self.cohesive]
+        edge_i = struct_i + cohesive_i
+        edge_j = struct_j + cohesive_j
+        edge_r = struct_r + [0.0] * len(cohesive_i)
+        edge_s = struct_s + [CUT_COHESIVE_STIFFNESS] * len(cohesive_i)
+
+        self._tri_list = self._rebuild_boundary_tris()
+
         n = len(self._pos_list)
         self.num_particles = n
-        self.num_springs = len(self._edge_i_list)
+        self.num_springs = len(edge_i)
         self.num_tets = len(self._tets_list)
 
-        pos_np = np.array(self._pos_list, dtype=np.float32)
-        vel_np = np.array(vel_list, dtype=np.float32)
+        pos_np  = np.array(self._pos_list, dtype=np.float32)
+        vel_np  = np.array(self._vel_list, dtype=np.float32)
         tets_np = np.array(self._tets_list, dtype=np.int64)
 
         self.pos        = wp.array(pos_np,                                   dtype=wp.vec3,    device=self.device)
         self.pred       = wp.array(pos_np.copy(),                            dtype=wp.vec3,    device=self.device)
         self.vel        = wp.array(vel_np,                                   dtype=wp.vec3,    device=self.device)
         self.inv_mass   = wp.array(np.array(self._inv_mass_list, dtype=np.float32), dtype=wp.float32, device=self.device)
-        self.spring_i   = wp.array(np.array(self._edge_i_list, dtype=np.int32),     dtype=wp.int32,   device=self.device)
-        self.spring_j   = wp.array(np.array(self._edge_j_list, dtype=np.int32),     dtype=wp.int32,   device=self.device)
-        self.rest_length= wp.array(np.array(self._edge_rest_list, dtype=np.float32), dtype=wp.float32, device=self.device)
-        self.stiffness  = wp.array(np.array(self._edge_stiff_list, dtype=np.float32), dtype=wp.float32, device=self.device)
+        self.spring_i   = wp.array(np.array(edge_i, dtype=np.int32),         dtype=wp.int32,   device=self.device)
+        self.spring_j   = wp.array(np.array(edge_j, dtype=np.int32),         dtype=wp.int32,   device=self.device)
+        self.rest_length= wp.array(np.array(edge_r, dtype=np.float32),       dtype=wp.float32, device=self.device)
+        self.stiffness  = wp.array(np.array(edge_s, dtype=np.float32),       dtype=wp.float32, device=self.device)
         self.tet_a      = wp.array(tets_np[:, 0].astype(np.int32),           dtype=wp.int32,   device=self.device)
         self.tet_b      = wp.array(tets_np[:, 1].astype(np.int32),           dtype=wp.int32,   device=self.device)
         self.tet_c      = wp.array(tets_np[:, 2].astype(np.int32),           dtype=wp.int32,   device=self.device)
@@ -1355,22 +1553,31 @@ class WarpSoftBodySim:
                 "radius": float(ROD_RADIUS),
             })
 
-        # ---- Cutting: advance the cut to wherever the rod's tip currently
-        # is, only while the tip is actually pressed into the pad (within
-        # its Y footprint and pushed down to/past its top surface). The tip
-        # -- not the rod's center -- is the working end that pokes/cuts. ----
+        # ---- Cutting: cut along wherever the rod's tip actually travels
+        # in XY while it's pressed into the pad (within its footprint and
+        # pushed down to/past its top surface). The tip -- not the rod's
+        # center -- is the working end that pokes/cuts. Unlike a single
+        # column index, this follows the tip's real path in any direction
+        # (X, Y, or a diagonal drag) and only severs the cells the tip
+        # actually swept through, one probe-radius segment at a time. ----
         if probe_world is not None:
             pwx, pwy, _ = probe_world
             pad_top_z = SOFT_CENTER[2] + SOFT_HALF_Z
             engaged = (
-                abs(pwy - SOFT_CENTER[1]) < SOFT_HALF_Y
+                abs(pwx - SOFT_CENTER[0]) < SOFT_HALF_X
+                and abs(pwy - SOFT_CENTER[1]) < SOFT_HALF_Y
                 and probe_tip_z < pad_top_z + SKIN
             )
             if engaged:
-                frac = (pwx - (SOFT_CENTER[0] - SOFT_HALF_X)) / (2 * SOFT_HALF_X)
-                target_col = int(round(frac * (SOFT_RES_X - 1)))
-                target_col = max(0, min(SOFT_RES_X - 1, target_col))
-                self._cube.advance_cut(target_col)
+                if self._cut_last_xy is not None:
+                    lx, ly = self._cut_last_xy
+                    self._cube.cut_segment(lx, ly, pwx, pwy)
+                self._cut_last_xy = (pwx, pwy)
+            else:
+                # Tip lifted clear of the pad -- forget the trail so the
+                # next press-in starts a fresh cut instead of drawing a
+                # phantom line from wherever it last was.
+                self._cut_last_xy = None
 
         # Physics step — base collision passed separately so it runs every
         # solver iteration (same priority as ground constraint)
@@ -1413,6 +1620,7 @@ class WarpSoftBodySim:
     # ------------------------------------------------------------------
     def _spawn(self):
         self._probe_last_good = None
+        self._cut_last_xy = None
         self._cube = SoftBodyCube(
             center=SOFT_CENTER,
             half_x=SOFT_HALF_X,
