@@ -1018,81 +1018,13 @@ def _vec3f_list(arr: np.ndarray):
 
 
 # ===========================================================================
-# GeoMagic controller
-# ===========================================================================
-
-GEOMAGIC_SHM_KEY  = 12345612
-GEOMAGIC_SCALE    = 1500.0
-GEOMAGIC_Z_OFFSET = 0.05
-
-try:
-    import sysv_ipc as _sysv
-    _SYSV_AVAILABLE = True
-except ImportError:
-    _SYSV_AVAILABLE = False
-
-
-class GeoMagicPipeController:
-    def __init__(self):
-        self._shm       = None
-        self._connected = False
-
-    @property
-    def connected(self) -> bool:
-        return self._connected
-
-    def connect(self) -> bool:
-        if not _SYSV_AVAILABLE:
-            return False
-        try:
-            self._shm = _sysv.SharedMemory(
-                GEOMAGIC_SHM_KEY, size=256,
-                flags=_sysv.IPC_CREAT, mode=0o644)
-            self._connected = True
-            return True
-        except Exception:
-            self._connected = False
-            return False
-
-    def read_position(self) -> tuple | None:
-        """Return (x, y, z) in Isaac world metres, or None on parse failure.
-
-        GeoMagic Touch tabletop orientation:
-            device X (left/right)  → world X (negated)
-            device Z (front/back)  → world Y (depth)
-            device Y (up/down)     → world Z (up, negated + offset)
-        """
-        if not self._connected or self._shm is None:
-            return None
-        try:
-            raw  = self._shm.read().decode("utf-8").replace("\x00","").strip()
-            if not raw: return None
-            parts = raw.split()
-            if len(parts) < 3: return None
-            x_raw,y_raw,z_raw = float(parts[0]),float(parts[1]),float(parts[2])
-            world_x = -z_raw / GEOMAGIC_SCALE
-            world_y = x_raw / GEOMAGIC_SCALE
-            world_z = y_raw / GEOMAGIC_SCALE + GEOMAGIC_Z_OFFSET
-            return (world_x, world_y, world_z)
-        except Exception:
-            return None
-
-    def disconnect(self):
-        if self._shm:
-            try: self._shm.detach()
-            except Exception: pass
-            self._shm = None
-        self._connected = False
-
-
-# ===========================================================================
 # WarpSoftBodySim — Isaac Sim scenario
 # ===========================================================================
 
 class WarpSoftBodySim:
     """Flat soft-body pad (skin-colored) resting on a rigid black base.
 
-    Probe (GeoMagic or viewport-dragged) pokes the top surface.
+    Probe (mouse/viewport-dragged) pokes the top surface.
     Any other prim with CollisionAPI also interacts via gather_colliders.
     """
 
@@ -1105,11 +1037,6 @@ class WarpSoftBodySim:
         self._ground             = None
         self._device             = None
         self._xform_cache        = None
-        self._geo_ctrl           = GeoMagicPipeController()
-        self._geo_enabled        = False
-        self._geo_smooth         = None
-        self._geo_alpha          = 0.4
-        self._geo_snap_dist      = 0.08
 
     # ------------------------------------------------------------------
     def load_example_assets(self):
@@ -1198,30 +1125,6 @@ class WarpSoftBodySim:
         self._spawn()
 
     # ------------------------------------------------------------------
-    def geomagic_connect(self) -> bool:
-        ok = self._geo_ctrl.connect()
-        self._geo_enabled = ok
-        if ok: self._geo_smooth = None
-        return ok
-
-    def set_geomagic_alpha(self, alpha: float):
-        global GEOMAGIC_Z_OFFSET
-        self._geo_alpha = float(max(0.01, min(1.0, alpha)))
-
-
-    def set_geomagic_z_offset(self, z_offset: float):
-        global GEOMAGIC_Z_OFFSET
-        GEOMAGIC_Z_OFFSET = float(z_offset)
-        
-    def geomagic_disconnect(self):
-        self._geo_ctrl.disconnect()
-        self._geo_enabled = False
-
-    @property
-    def geomagic_connected(self) -> bool:
-        return self._geo_ctrl.connected
-
-    # ------------------------------------------------------------------
     def update(self, step: float):
         if self._cube is None:
             return False
@@ -1262,23 +1165,10 @@ class WarpSoftBodySim:
         # compounding a little further every single frame. Clearing
         # everything down to zero first, then setting the one canonical
         # op, is safe regardless of which behavior the gizmo actually has.
-        if self._probe is not None and not self._geo_enabled:
+        if self._probe is not None:
             vx, vy, vz = self._prim_world_translation(PROBE_PRIM_PATH)
             self._clear_prim_xform(PROBE_PRIM_PATH)
             self._probe_translate_op.Set(Gf.Vec3d(vx, vy, vz))
-
-        # GeoMagic
-        if self._geo_enabled:
-            gp = self._geo_ctrl.read_position()
-            if gp is not None:
-                raw = np.array(gp, dtype=np.float64)
-                if self._geo_smooth is None:
-                    self._geo_smooth = raw.copy()
-                else:
-                    dist  = float(np.linalg.norm(raw - self._geo_smooth))
-                    alpha = 1.0 if dist>self._geo_snap_dist else self._geo_alpha
-                    self._geo_smooth = (1-alpha)*self._geo_smooth + alpha*raw
-                self._set_probe_position(tuple(self._geo_smooth.tolist()))
 
         # Gather external colliders (skip base and probe — handled separately)
         self._xform_cache.Clear()
