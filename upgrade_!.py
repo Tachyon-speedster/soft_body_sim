@@ -50,14 +50,48 @@ SOFT_RES_Z   = 6    # particles along Z (thin) → spacing = 2*0.01/5 ≈ 4.0 mm
 # Total particles: 20*20*6 = 2400
 # Total tets: (19*19*5)*6 = 10830
 
-# Probe — surgical "rod" tool: a thin vertical capsule that hangs above
-# the pad. Touching it deforms the pad (normal collision); dragging it
-# sideways while pressed into the pad advances the cut.
-ROD_RADIUS   = 0.0035    # 3.5mm rod radius
-ROD_LENGTH   = 0.05      # 5cm rod length
+# Probe — surgical scalpel: a thin blade (the working, cutting end) plus
+# a separate, thicker handle above it for visual read only. The blade's
+# COLLISION geometry (ROD_RADIUS / ROD_LENGTH below) is what actually
+# drives the physics -- it stays a simple vertical capsule internally
+# (collide_capsule doesn't care what it looks like), but is now sized and
+# skinned like an actual blade edge rather than a rod:
+#
+#   - ROD_RADIUS was 3.5mm. Combined with the old global SKIN (5mm) that
+#     gave an 8.5mm total push-out radius around the tool -- bigger than
+#     an entire mesh cell at the new (denser) 5.3mm particle spacing. That
+#     oversized exclusion zone is exactly what read as a blunt "bat"
+#     strike instead of a thin blade poke: touching the pad anywhere near
+#     the tip bulged out a whole neighborhood of particles at once.
+#   - Fix has two parts: (1) shrink ROD_RADIUS down to actual blade-edge
+#     thickness, and (2) give the probe its OWN much tighter skin margin
+#     (PROBE_SKIN below) instead of sharing the global SKIN constant used
+#     by the rigid base and other colliders -- so this doesn't loosen
+#     contact behavior anywhere else in the scene.
+ROD_RADIUS   = 0.0008    # 0.8mm -- actual blade-edge collision thickness
+ROD_LENGTH   = 0.03      # 3cm working blade collision length
 ROD_HALF_LEN = ROD_LENGTH * 0.5
-PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + ROD_LENGTH + 0.01)
-PROBE_COLOR  = np.array([0.75, 0.45, 0.15])
+PROBE_SKIN   = 0.0003    # 0.3mm -- probe-only collision skin (vs. global
+                          # SKIN = 5mm below, which stays untouched for
+                          # every OTHER collider in the scene)
+
+# Visual-only geometry (no physics effect -- see _dispatch_collider,
+# which still just uses ROD_RADIUS/ROD_LENGTH/PROBE_SKIN for the actual
+# collision capsule regardless of how the probe is drawn). The blade
+# visual is a tapered pyramid (wide flat base near the handle, pointed
+# tip) authored directly at +/-ROD_HALF_LEN from the probe's origin, so
+# it lines up exactly with the invisible collision capsule; the handle
+# is a plain cylinder sitting above it.
+BLADE_WIDTH     = 0.006   # 6mm at the base, tapering to a point
+BLADE_THICKNESS = 0.0015  # 1.5mm -- slightly thicker than the collision
+                           # radius so the blade stays visible; purely
+                           # cosmetic, doesn't feed back into physics
+BLADE_COLOR     = np.array([0.80, 0.82, 0.85])   # bright steel/silver
+HANDLE_RADIUS   = 0.0035  # 3.5mm handle radius
+HANDLE_LENGTH   = 0.045   # 4.5cm handle, sits directly above the blade
+HANDLE_COLOR    = np.array([0.12, 0.12, 0.13])   # dark grip, for contrast
+
+PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + ROD_LENGTH + HANDLE_LENGTH * 0.5 + 0.02)
 
 # Tissue colors: the pad's outer surface reads as skin; any face exposed
 # by cutting into the interior (i.e. not part of the original outer
@@ -1296,12 +1330,19 @@ class SoftBodyCube:
                   device=self.device)
 
     def _dispatch_collider(self, c: dict, friction: float):
+        # Per-collider skin override: most colliders (rigid base, scanned
+        # scene props) still use the global SKIN margin exactly as before.
+        # A collider dict can supply its own "skin" key to override this --
+        # currently only the probe's capsule does, so it can use a much
+        # tighter margin appropriate to a thin blade edge without loosening
+        # contact behavior anywhere else.
+        skin = float(c.get("skin", SKIN))
         sh = c["shape"]
         if sh == SHAPE_SPHERE:
             wp.launch(collide_sphere, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
                                wp.vec3(*c["center"]),float(c["radius"]),
-                               float(SKIN),float(friction)],
+                               skin,float(friction)],
                       device=self.device)
         elif sh == SHAPE_BOX:
             r0,r1,r2 = c["row0"],c["row1"],c["row2"]
@@ -1312,13 +1353,13 @@ class SoftBodyCube:
                                wp.vec3(float(r1[0]),float(r1[1]),float(r1[2])),
                                wp.vec3(float(r2[0]),float(r2[1]),float(r2[2])),
                                float(c["half_x"]),float(c["half_y"]),float(c["half_z"]),
-                               float(SKIN),float(friction)],
+                               skin,float(friction)],
                       device=self.device)
         elif sh == SHAPE_CAPSULE:
             wp.launch(collide_capsule, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
                                wp.vec3(*c["p0"]),wp.vec3(*c["p1"]),
-                               float(c["radius"]),float(SKIN),float(friction)],
+                               float(c["radius"]),skin,float(friction)],
                       device=self.device)
         elif sh == SHAPE_CYLINDER:
             cr = float(c.get("collide_radius", c["radius"]))
@@ -1326,14 +1367,14 @@ class SoftBodyCube:
                       inputs=[self.pred,self.inv_mass,self.vel,
                                wp.vec3(*c["center"]),wp.vec3(*c["axis"]),
                                cr,float(c["half_len"]),
-                               float(SKIN),float(friction)],
+                               skin,float(friction)],
                       device=self.device)
         elif sh == SHAPE_CONE:
             wp.launch(collide_cone, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
                                wp.vec3(*c["apex"]),wp.vec3(*c["axis"]),
                                float(c["half_angle"]),float(c["height"]),
-                               float(SKIN),float(friction)],
+                               skin,float(friction)],
                       device=self.device)
 
     def step(
@@ -1486,26 +1527,73 @@ class WarpSoftBodySim:
             "half_z": BASE_HALF_Z,
         }
 
-        # Probe — surgical rod: a vertical capsule, kinematic rigid body.
-        # No scale op needed -- radius/height attrs define the capsule
-        # directly, so the only xformOp on this prim we ever author is
-        # translate (rotate/orient ops the viewport gizmo may add are
-        # excluded from the transform order each frame, not zeroed --
-        # see _clear_prim_xform).
-        probe = UsdGeom.Capsule.Define(stage, PROBE_PRIM_PATH)
-        probe.CreateRadiusAttr(ROD_RADIUS)
-        probe.CreateHeightAttr(ROD_LENGTH)
-        probe.CreateAxisAttr(UsdGeom.Tokens.z)
-        probe.CreateDisplayColorAttr([Gf.Vec3f(*PROBE_COLOR.tolist())])
+        # Probe — surgical scalpel, kinematic rigid body. Visually a
+        # compound of two child prims (dark cylinder handle + tapered
+        # silver blade), but the parent Xform is still the single prim
+        # that carries the translate op everything else in this file
+        # reads/writes/clears (_prim_world_translation, _clear_prim_xform,
+        # _probe_translate_op) -- so none of that logic needed to change.
+        # The ACTUAL collision shape used for cutting/pushing the pad is
+        # still just a simple capsule built from ROD_RADIUS/ROD_LENGTH in
+        # _update_impl; it is entirely independent of how the tool is
+        # drawn here.
+        probe = UsdGeom.Xform.Define(stage, PROBE_PRIM_PATH)
         xfp = UsdGeom.Xformable(probe.GetPrim())
         self._probe_translate_op = xfp.AddTranslateOp()
         self._probe_translate_op.Set(Gf.Vec3d(*PROBE_CENTER))
         rba2 = UsdPhysics.RigidBodyAPI.Apply(probe.GetPrim())
         rba2.CreateKinematicEnabledAttr(True)
-        UsdPhysics.CollisionAPI.Apply(probe.GetPrim())
-        # PhysX supports capsules natively -- no convex-hull approximation
-        # needed here (that was only for the old box-shaped probe).
         self._probe = probe
+
+        # Handle -- plain cylinder, sits directly above the blade base
+        # (local z = +ROD_HALF_LEN, where the blade's wide end is). Carries
+        # the actual PhysX CollisionAPI so the tool stays grab/drag-able in
+        # the viewport exactly as the old single capsule was; this has no
+        # bearing on the soft-body cut, which is computed manually.
+        handle_path = PROBE_PRIM_PATH + "/Handle"
+        handle = UsdGeom.Cylinder.Define(stage, handle_path)
+        handle.CreateRadiusAttr(HANDLE_RADIUS)
+        handle.CreateHeightAttr(HANDLE_LENGTH)
+        handle.CreateAxisAttr(UsdGeom.Tokens.z)
+        handle.CreateDisplayColorAttr([Gf.Vec3f(*HANDLE_COLOR.tolist())])
+        UsdGeom.Xformable(handle.GetPrim()).AddTranslateOp().Set(
+            Gf.Vec3d(0.0, 0.0, ROD_HALF_LEN + HANDLE_LENGTH * 0.5))
+        UsdPhysics.CollisionAPI.Apply(handle.GetPrim())
+        UsdPhysics.MeshCollisionAPI.Apply(handle.GetPrim()).CreateApproximationAttr("convexHull")
+
+        # Blade -- a thin tapered pyramid (flat rectangular base near the
+        # handle, pointed tip at the working end), authored directly in
+        # the parent's local space so its base sits at +ROD_HALF_LEN and
+        # its tip at -ROD_HALF_LEN -- i.e. exactly flush with the two ends
+        # of the invisible collision capsule used for cutting, so what you
+        # see lines up with what actually touches the pad. Visual only, no
+        # physics APIs applied (a mesh this thin isn't a great PhysX
+        # collision shape anyway, and it isn't needed -- the handle above
+        # already provides a stable, grabbable collision proxy for the
+        # whole compound rigid body).
+        half_w = BLADE_WIDTH * 0.5
+        half_t = BLADE_THICKNESS * 0.5
+        blade_top_z = ROD_HALF_LEN
+        blade_tip_z = -ROD_HALF_LEN
+        blade_points = [
+            Gf.Vec3f(-half_w, -half_t, blade_top_z),   # 0: base corner
+            Gf.Vec3f( half_w, -half_t, blade_top_z),   # 1: base corner
+            Gf.Vec3f( half_w,  half_t, blade_top_z),   # 2: base corner
+            Gf.Vec3f(-half_w,  half_t, blade_top_z),   # 3: base corner
+            Gf.Vec3f(0.0,      0.0,    blade_tip_z),   # 4: tip (apex)
+        ]
+        blade_path = PROBE_PRIM_PATH + "/Blade"
+        blade = UsdGeom.Mesh.Define(stage, blade_path)
+        blade.CreatePointsAttr(blade_points)
+        blade.CreateFaceVertexCountsAttr([4, 3, 3, 3, 3])
+        blade.CreateFaceVertexIndicesAttr(
+            [0, 1, 2, 3,   # base quad
+             0, 1, 4,      # 4 tapering side faces down to the tip
+             1, 2, 4,
+             2, 3, 4,
+             3, 0, 4])
+        blade.CreateDoubleSidedAttr(True)
+        blade.CreateDisplayColorAttr([Gf.Vec3f(*BLADE_COLOR.tolist())])
 
         # Soft body render mesh (points written each frame). Color is a
         # per-face primvar (skin vs. muscle), authored once self._cube
@@ -1630,6 +1718,9 @@ class WarpSoftBodySim:
                 "p0":     (cx, cy, cz + ROD_HALF_LEN),
                 "p1":     (cx, cy, probe_tip_z),
                 "radius": float(ROD_RADIUS),
+                "skin":   float(PROBE_SKIN),   # tight blade-edge margin,
+                                                 # not the global SKIN used
+                                                 # by the rigid base/props
             })
 
         # ---- Cutting: cut along wherever the rod's tip actually travels
