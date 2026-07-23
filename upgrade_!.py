@@ -7,7 +7,7 @@ import carb
 import omni.usd
 from isaacsim.core.api.objects import GroundPlane
 from isaacsim.core.utils.viewports import set_camera_view
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, Vt
 
 # ---------------------------------------------------------------------------
 # USD prim paths
@@ -50,48 +50,18 @@ SOFT_RES_Z   = 6    # particles along Z (thin) → spacing = 2*0.01/5 ≈ 4.0 mm
 # Total particles: 20*20*6 = 2400
 # Total tets: (19*19*5)*6 = 10830
 
-# Probe — surgical scalpel: a thin blade (the working, cutting end) plus
-# a separate, thicker handle above it for visual read only. The blade's
-# COLLISION geometry (ROD_RADIUS / ROD_LENGTH below) is what actually
-# drives the physics -- it stays a simple vertical capsule internally
-# (collide_capsule doesn't care what it looks like), but is now sized and
-# skinned like an actual blade edge rather than a rod:
-#
-#   - ROD_RADIUS was 3.5mm. Combined with the old global SKIN (5mm) that
-#     gave an 8.5mm total push-out radius around the tool -- bigger than
-#     an entire mesh cell at the new (denser) 5.3mm particle spacing. That
-#     oversized exclusion zone is exactly what read as a blunt "bat"
-#     strike instead of a thin blade poke: touching the pad anywhere near
-#     the tip bulged out a whole neighborhood of particles at once.
-#   - Fix has two parts: (1) shrink ROD_RADIUS down to actual blade-edge
-#     thickness, and (2) give the probe its OWN much tighter skin margin
-#     (PROBE_SKIN below) instead of sharing the global SKIN constant used
-#     by the rigid base and other colliders -- so this doesn't loosen
-#     contact behavior anywhere else in the scene.
-ROD_RADIUS   = 0.0008    # 0.8mm -- actual blade-edge collision thickness
-ROD_LENGTH   = 0.03      # 3cm working blade collision length
+# Probe — surgical "rod" tool: a thin vertical capsule that hangs above
+# the pad. Touching it deforms the pad (normal collision); dragging it
+# sideways while pressed into the pad advances the cut.
+# Slimmed down to read as an actual fine surgical instrument rather than
+# a blunt rod — a smaller radius pushes far less tissue aside per unit
+# of travel, which keeps deformation localized to the incision line
+# instead of ballooning the whole local mesh outward.
+ROD_RADIUS   = 0.0012    # 1.2mm rod radius (was 3.5mm)
+ROD_LENGTH   = 0.05      # 5cm rod length
 ROD_HALF_LEN = ROD_LENGTH * 0.5
-PROBE_SKIN   = 0.0003    # 0.3mm -- probe-only collision skin (vs. global
-                          # SKIN = 5mm below, which stays untouched for
-                          # every OTHER collider in the scene)
-
-# Visual-only geometry (no physics effect -- see _dispatch_collider,
-# which still just uses ROD_RADIUS/ROD_LENGTH/PROBE_SKIN for the actual
-# collision capsule regardless of how the probe is drawn). The blade
-# visual is a tapered pyramid (wide flat base near the handle, pointed
-# tip) authored directly at +/-ROD_HALF_LEN from the probe's origin, so
-# it lines up exactly with the invisible collision capsule; the handle
-# is a plain cylinder sitting above it.
-BLADE_WIDTH     = 0.006   # 6mm at the base, tapering to a point
-BLADE_THICKNESS = 0.0015  # 1.5mm -- slightly thicker than the collision
-                           # radius so the blade stays visible; purely
-                           # cosmetic, doesn't feed back into physics
-BLADE_COLOR     = np.array([0.80, 0.82, 0.85])   # bright steel/silver
-HANDLE_RADIUS   = 0.0035  # 3.5mm handle radius
-HANDLE_LENGTH   = 0.045   # 4.5cm handle, sits directly above the blade
-HANDLE_COLOR    = np.array([0.12, 0.12, 0.13])   # dark grip, for contrast
-
-PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + ROD_LENGTH + HANDLE_LENGTH * 0.5 + 0.02)
+PROBE_CENTER = (0.15, 0.0, BASE_HALF_Z * 2 + ROD_LENGTH + 0.01)
+PROBE_COLOR  = np.array([0.75, 0.45, 0.15])
 
 # Tissue colors: the pad's outer surface reads as skin; any face exposed
 # by cutting into the interior (i.e. not part of the original outer
@@ -108,7 +78,15 @@ PIPE_CENTER          = PROBE_CENTER
 PIPE_AXIS            = (0.0, 0.0, 1.0)
 PIPE_HALF_LEN        = ROD_HALF_LEN
 
-SKIN = 0.005   # 1 mm collision skin
+# Collision skin margin added on top of every collider's raw radius/half
+# extents (see collide_* kernels: `lim = radius + skin`). Previously this
+# was 0.005 (5mm) despite its comment claiming 1mm — combined with the
+# old 3.5mm rod radius that gave an effective probe collision extent of
+# 8.5mm, WIDER than the ~5.3mm grid spacing, which is what caused the
+# mesh to billow out during cuts instead of parting cleanly. Brought down
+# to match the comment's original intent and to stay comfortably thinner
+# than the grid spacing once combined with the slimmed ROD_RADIUS above.
+SKIN = 0.0008   # 0.8mm collision skin
 
 # ---------------------------------------------------------------------------
 # Simulation constants
@@ -1329,52 +1307,96 @@ class SoftBodyCube:
                           float(1.0/max(dt,1e-6))],
                   device=self.device)
 
+    # ------------------------------------------------------------------
+    # Collider packing — see step()/`_pack_collider` for why this exists.
+    # ------------------------------------------------------------------
+    def _pack_collider(self, c: dict):
+        """Convert a collider dict's raw Python floats/tuples into wp.vec3
+        objects ONCE per step() call.
+
+        Previously this conversion happened inside _dispatch_collider,
+        which is invoked once per solver iteration -- SUBSTEPS *
+        SOLVER_ITERS times per frame (120 with the defaults below). Since
+        a collider's world transform doesn't change mid-step, that meant
+        rebuilding the same wp.vec3 objects up to 120x per frame per
+        collider for no reason -- pure wasted CPU-side Python object
+        construction sitting in the hot path. Packing once here and
+        reusing the packed dict across every inner iteration removes that
+        redundant work without changing any collision math.
+        """
+        sh = c["shape"]
+        if sh == SHAPE_SPHERE:
+            return {"shape": sh,
+                    "center": wp.vec3(*c["center"]),
+                    "radius": float(c["radius"])}
+        elif sh == SHAPE_BOX:
+            r0, r1, r2 = c["row0"], c["row1"], c["row2"]
+            return {"shape": sh,
+                    "center": wp.vec3(*c["center"]),
+                    "row0": wp.vec3(float(r0[0]), float(r0[1]), float(r0[2])),
+                    "row1": wp.vec3(float(r1[0]), float(r1[1]), float(r1[2])),
+                    "row2": wp.vec3(float(r2[0]), float(r2[1]), float(r2[2])),
+                    "half_x": float(c["half_x"]),
+                    "half_y": float(c["half_y"]),
+                    "half_z": float(c["half_z"])}
+        elif sh == SHAPE_CAPSULE:
+            return {"shape": sh,
+                    "p0": wp.vec3(*c["p0"]),
+                    "p1": wp.vec3(*c["p1"]),
+                    "radius": float(c["radius"])}
+        elif sh == SHAPE_CYLINDER:
+            return {"shape": sh,
+                    "center": wp.vec3(*c["center"]),
+                    "axis": wp.vec3(*c["axis"]),
+                    "collide_radius": float(c.get("collide_radius", c["radius"])),
+                    "half_len": float(c["half_len"])}
+        elif sh == SHAPE_CONE:
+            return {"shape": sh,
+                    "apex": wp.vec3(*c["apex"]),
+                    "axis": wp.vec3(*c["axis"]),
+                    "half_angle": float(c["half_angle"]),
+                    "height": float(c["height"])}
+        # Unknown shape -- pass through unchanged (dispatch will just
+        # silently no-op on it, same as before).
+        return c
+
     def _dispatch_collider(self, c: dict, friction: float):
-        # Per-collider skin override: most colliders (rigid base, scanned
-        # scene props) still use the global SKIN margin exactly as before.
-        # A collider dict can supply its own "skin" key to override this --
-        # currently only the probe's capsule does, so it can use a much
-        # tighter margin appropriate to a thin blade edge without loosening
-        # contact behavior anywhere else.
-        skin = float(c.get("skin", SKIN))
+        """c is a PRE-PACKED collider (see _pack_collider): its vec3
+        fields are already real wp.vec3 objects, so this only launches
+        the matching kernel -- no per-call Python object construction."""
         sh = c["shape"]
         if sh == SHAPE_SPHERE:
             wp.launch(collide_sphere, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
-                               wp.vec3(*c["center"]),float(c["radius"]),
-                               skin,float(friction)],
+                               c["center"],c["radius"],
+                               float(SKIN),float(friction)],
                       device=self.device)
         elif sh == SHAPE_BOX:
-            r0,r1,r2 = c["row0"],c["row1"],c["row2"]
             wp.launch(collide_box, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
-                               wp.vec3(*c["center"]),
-                               wp.vec3(float(r0[0]),float(r0[1]),float(r0[2])),
-                               wp.vec3(float(r1[0]),float(r1[1]),float(r1[2])),
-                               wp.vec3(float(r2[0]),float(r2[1]),float(r2[2])),
-                               float(c["half_x"]),float(c["half_y"]),float(c["half_z"]),
-                               skin,float(friction)],
+                               c["center"], c["row0"], c["row1"], c["row2"],
+                               c["half_x"], c["half_y"], c["half_z"],
+                               float(SKIN),float(friction)],
                       device=self.device)
         elif sh == SHAPE_CAPSULE:
             wp.launch(collide_capsule, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
-                               wp.vec3(*c["p0"]),wp.vec3(*c["p1"]),
-                               float(c["radius"]),skin,float(friction)],
+                               c["p0"], c["p1"],
+                               c["radius"],float(SKIN),float(friction)],
                       device=self.device)
         elif sh == SHAPE_CYLINDER:
-            cr = float(c.get("collide_radius", c["radius"]))
             wp.launch(collide_cylinder, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
-                               wp.vec3(*c["center"]),wp.vec3(*c["axis"]),
-                               cr,float(c["half_len"]),
-                               skin,float(friction)],
+                               c["center"], c["axis"],
+                               c["collide_radius"], c["half_len"],
+                               float(SKIN),float(friction)],
                       device=self.device)
         elif sh == SHAPE_CONE:
             wp.launch(collide_cone, dim=self.num_particles,
                       inputs=[self.pred,self.inv_mass,self.vel,
-                               wp.vec3(*c["apex"]),wp.vec3(*c["axis"]),
-                               float(c["half_angle"]),float(c["height"]),
-                               skin,float(friction)],
+                               c["apex"], c["axis"],
+                               c["half_angle"], c["height"],
+                               float(SKIN),float(friction)],
                       device=self.device)
 
     def step(
@@ -1393,6 +1415,12 @@ class SoftBodyCube:
         sub_dt    = dt / substeps
         gv        = wp.vec3(*gravity)
         colliders = colliders or []
+
+        # Pack every collider's wp.vec3 fields ONCE per step() call --
+        # was previously done inside the inner substeps*solver_iters loop
+        # (see _pack_collider docstring above for why that was wasteful).
+        packed_base       = self._pack_collider(base_box) if base_box is not None else None
+        packed_colliders  = [self._pack_collider(c) for c in colliders]
 
         for _ in range(substeps):
             wp.launch(integrate, dim=self.num_particles,
@@ -1421,8 +1449,8 @@ class SoftBodyCube:
                           device=self.device)
 
                 # Collide with rigid base (always present, treated like a collider)
-                if base_box is not None:
-                    self._dispatch_collider(base_box, friction)
+                if packed_base is not None:
+                    self._dispatch_collider(packed_base, friction)
 
                 if ground_z is not None:
                     wp.launch(collide_ground, dim=self.num_particles,
@@ -1434,7 +1462,7 @@ class SoftBodyCube:
                                       float(ground_z),float(static_friction)],
                               device=self.device)
 
-                for col in colliders:
+                for col in packed_colliders:
                     self._dispatch_collider(col, friction)
 
             wp.launch(update_velocity, dim=self.num_particles,
@@ -1451,6 +1479,23 @@ def _vec3f_list(arr: np.ndarray):
     return [Gf.Vec3f(float(x), float(y), float(z)) for x, y, z in arr]
 
 
+def _vec3f_array(arr: np.ndarray):
+    """Build a VtVec3fArray directly from a numpy buffer instead of
+    looping through Python and constructing one Gf.Vec3f per element.
+
+    This is the hot path called every single frame for particle
+    positions (and on topology-change frames for face colors), so
+    avoiding a Python-level per-particle loop matters as particle count
+    grows from cutting. Falls back to the slow per-element path only if
+    this USD build's Vt bindings don't accept a numpy buffer directly.
+    """
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    try:
+        return Vt.Vec3fArray(arr)
+    except Exception:
+        return _vec3f_list(arr)
+
+
 # ===========================================================================
 # WarpSoftBodySim — Isaac Sim scenario
 # ===========================================================================
@@ -1461,6 +1506,14 @@ class WarpSoftBodySim:
     Probe (mouse/viewport-dragged) pokes the top surface.
     Any other prim with CollisionAPI also interacts via gather_colliders.
     """
+
+    # How many frames to reuse a cached stage-wide collider scan before
+    # re-scanning. gather_colliders() walks the ENTIRE stage every time
+    # it's called, which is wasted work on frames where nothing besides
+    # the softbody/probe/base (already excluded) has moved. If you have
+    # OTHER dynamic rigid bodies that need to interact with the pad every
+    # single frame, lower this (e.g. to 1-3) so they stay responsive.
+    COLLIDER_RESCAN_EVERY = 15
 
     def __init__(self):
         self._cube               = None
@@ -1479,6 +1532,10 @@ class WarpSoftBodySim:
                                            # primvar handle, created in _spawn()
         self._cut_last_xy        = None   # last probe XY while engaged in a
                                            # cut, used by cut_segment tracing
+
+        # Throttled stage-wide collider scan cache (see COLLIDER_RESCAN_EVERY).
+        self._collider_cache          = []
+        self._collider_rescan_counter = 0
 
     # ------------------------------------------------------------------
     def load_example_assets(self):
@@ -1527,73 +1584,26 @@ class WarpSoftBodySim:
             "half_z": BASE_HALF_Z,
         }
 
-        # Probe — surgical scalpel, kinematic rigid body. Visually a
-        # compound of two child prims (dark cylinder handle + tapered
-        # silver blade), but the parent Xform is still the single prim
-        # that carries the translate op everything else in this file
-        # reads/writes/clears (_prim_world_translation, _clear_prim_xform,
-        # _probe_translate_op) -- so none of that logic needed to change.
-        # The ACTUAL collision shape used for cutting/pushing the pad is
-        # still just a simple capsule built from ROD_RADIUS/ROD_LENGTH in
-        # _update_impl; it is entirely independent of how the tool is
-        # drawn here.
-        probe = UsdGeom.Xform.Define(stage, PROBE_PRIM_PATH)
+        # Probe — surgical rod: a vertical capsule, kinematic rigid body.
+        # No scale op needed -- radius/height attrs define the capsule
+        # directly, so the only xformOp on this prim we ever author is
+        # translate (rotate/orient ops the viewport gizmo may add are
+        # excluded from the transform order each frame, not zeroed --
+        # see _clear_prim_xform).
+        probe = UsdGeom.Capsule.Define(stage, PROBE_PRIM_PATH)
+        probe.CreateRadiusAttr(ROD_RADIUS)
+        probe.CreateHeightAttr(ROD_LENGTH)
+        probe.CreateAxisAttr(UsdGeom.Tokens.z)
+        probe.CreateDisplayColorAttr([Gf.Vec3f(*PROBE_COLOR.tolist())])
         xfp = UsdGeom.Xformable(probe.GetPrim())
         self._probe_translate_op = xfp.AddTranslateOp()
         self._probe_translate_op.Set(Gf.Vec3d(*PROBE_CENTER))
         rba2 = UsdPhysics.RigidBodyAPI.Apply(probe.GetPrim())
         rba2.CreateKinematicEnabledAttr(True)
+        UsdPhysics.CollisionAPI.Apply(probe.GetPrim())
+        # PhysX supports capsules natively -- no convex-hull approximation
+        # needed here (that was only for the old box-shaped probe).
         self._probe = probe
-
-        # Handle -- plain cylinder, sits directly above the blade base
-        # (local z = +ROD_HALF_LEN, where the blade's wide end is). Carries
-        # the actual PhysX CollisionAPI so the tool stays grab/drag-able in
-        # the viewport exactly as the old single capsule was; this has no
-        # bearing on the soft-body cut, which is computed manually.
-        handle_path = PROBE_PRIM_PATH + "/Handle"
-        handle = UsdGeom.Cylinder.Define(stage, handle_path)
-        handle.CreateRadiusAttr(HANDLE_RADIUS)
-        handle.CreateHeightAttr(HANDLE_LENGTH)
-        handle.CreateAxisAttr(UsdGeom.Tokens.z)
-        handle.CreateDisplayColorAttr([Gf.Vec3f(*HANDLE_COLOR.tolist())])
-        UsdGeom.Xformable(handle.GetPrim()).AddTranslateOp().Set(
-            Gf.Vec3d(0.0, 0.0, ROD_HALF_LEN + HANDLE_LENGTH * 0.5))
-        UsdPhysics.CollisionAPI.Apply(handle.GetPrim())
-        UsdPhysics.MeshCollisionAPI.Apply(handle.GetPrim()).CreateApproximationAttr("convexHull")
-
-        # Blade -- a thin tapered pyramid (flat rectangular base near the
-        # handle, pointed tip at the working end), authored directly in
-        # the parent's local space so its base sits at +ROD_HALF_LEN and
-        # its tip at -ROD_HALF_LEN -- i.e. exactly flush with the two ends
-        # of the invisible collision capsule used for cutting, so what you
-        # see lines up with what actually touches the pad. Visual only, no
-        # physics APIs applied (a mesh this thin isn't a great PhysX
-        # collision shape anyway, and it isn't needed -- the handle above
-        # already provides a stable, grabbable collision proxy for the
-        # whole compound rigid body).
-        half_w = BLADE_WIDTH * 0.5
-        half_t = BLADE_THICKNESS * 0.5
-        blade_top_z = ROD_HALF_LEN
-        blade_tip_z = -ROD_HALF_LEN
-        blade_points = [
-            Gf.Vec3f(-half_w, -half_t, blade_top_z),   # 0: base corner
-            Gf.Vec3f( half_w, -half_t, blade_top_z),   # 1: base corner
-            Gf.Vec3f( half_w,  half_t, blade_top_z),   # 2: base corner
-            Gf.Vec3f(-half_w,  half_t, blade_top_z),   # 3: base corner
-            Gf.Vec3f(0.0,      0.0,    blade_tip_z),   # 4: tip (apex)
-        ]
-        blade_path = PROBE_PRIM_PATH + "/Blade"
-        blade = UsdGeom.Mesh.Define(stage, blade_path)
-        blade.CreatePointsAttr(blade_points)
-        blade.CreateFaceVertexCountsAttr([4, 3, 3, 3, 3])
-        blade.CreateFaceVertexIndicesAttr(
-            [0, 1, 2, 3,   # base quad
-             0, 1, 4,      # 4 tapering side faces down to the tip
-             1, 2, 4,
-             2, 3, 4,
-             3, 0, 4])
-        blade.CreateDoubleSidedAttr(True)
-        blade.CreateDisplayColorAttr([Gf.Vec3f(*BLADE_COLOR.tolist())])
 
         # Soft body render mesh (points written each frame). Color is a
         # per-face primvar (skin vs. muscle), authored once self._cube
@@ -1613,9 +1623,24 @@ class WarpSoftBodySim:
             camera_prim_path="/OmniverseKit_Persp",
         )
         wp.init()
-        self._device      = wp.get_preferred_device()
+        self._device      = self._select_device()
         self._xform_cache = UsdGeom.XformCache()
         self._spawn()
+
+    def _select_device(self):
+        """Prefer a second CUDA GPU for Warp physics so it doesn't contend
+        with whichever GPU is driving the RTX viewport. Falls back to
+        Warp's normal preferred-device pick if only one GPU (or no CUDA
+        device) is available -- this is a pure "use what's there" upgrade,
+        never a hard requirement."""
+        try:
+            cuda_devices = wp.get_cuda_devices()
+            if cuda_devices and len(cuda_devices) > 1:
+                return cuda_devices[1]
+        except Exception as e:
+            carb.log_warn(f"[WarpSoftBody] multi-GPU device probe failed, "
+                           f"falling back to preferred device: {e}")
+        return wp.get_preferred_device()
 
     def reset(self):
         self._spawn()
@@ -1698,10 +1723,18 @@ class WarpSoftBodySim:
                 self._clear_prim_xform(PROBE_PRIM_PATH)
                 self._probe_translate_op.Set(Gf.Vec3d(vx, vy, vz))
 
-        # Gather external colliders (skip base and probe — handled separately)
-        self._xform_cache.Clear()
-        skip = _OWN_PATHS | {SOFT_BODY_PRIM_PATH, PROBE_PRIM_PATH, BASE_PRIM_PATH}
-        colliders = gather_colliders(stage, skip, self._xform_cache)
+        # Gather external colliders (skip base and probe — handled separately).
+        # Throttled: gather_colliders() walks the ENTIRE stage, so on
+        # frames where we don't rescan we just reuse last scan's result.
+        # See COLLIDER_RESCAN_EVERY docstring for when to tighten this.
+        self._collider_rescan_counter += 1
+        if (self._collider_rescan_counter >= self.COLLIDER_RESCAN_EVERY
+                or not self._collider_cache):
+            self._xform_cache.Clear()
+            skip = _OWN_PATHS | {SOFT_BODY_PRIM_PATH, PROBE_PRIM_PATH, BASE_PRIM_PATH}
+            self._collider_cache = gather_colliders(stage, skip, self._xform_cache)
+            self._collider_rescan_counter = 0
+        colliders = list(self._collider_cache)
 
         # Probe collider from translate op -- the rod is a vertical
         # capsule, so its collider is defined by the two endpoints of its
@@ -1718,9 +1751,6 @@ class WarpSoftBodySim:
                 "p0":     (cx, cy, cz + ROD_HALF_LEN),
                 "p1":     (cx, cy, probe_tip_z),
                 "radius": float(ROD_RADIUS),
-                "skin":   float(PROBE_SKIN),   # tight blade-edge margin,
-                                                 # not the global SKIN used
-                                                 # by the rigid base/props
             })
 
         # ---- Cutting: cut along wherever the rod's tip actually travels
@@ -1765,9 +1795,10 @@ class WarpSoftBodySim:
         )
         self._cube._check_cohesive_breaks()
 
-        # Write positions to USD render mesh. Face-vertex INDICES are
-        # re-set every frame too (not just at spawn) -- and, critically,
-        # so is faceVertexCounts. Cutting DOES change how many triangles
+        # Write positions to USD render mesh. Face-vertex INDICES (and
+        # per-face colors) are only re-uploaded on frames where the
+        # triangle count actually changed (i.e. a cut just fired) -- not
+        # every single frame. Cutting DOES change how many triangles
         # exist: severing a wall splits a grid vertex into two duplicate
         # particle columns, which turns previously-internal faces (shared
         # by two tets, so not boundary) into faces that are now only
@@ -1776,9 +1807,11 @@ class WarpSoftBodySim:
         # If faceVertexCounts is left stale (its length no longer matches
         # how faceVertexIndices actually chunks into triangles), USD sees
         # an inconsistent mesh and Hydra culls/hides it outright -- this
-        # was the "mesh deletes itself while cutting" bug. Recomputing it
-        # whenever the triangle count changes keeps the two attributes
-        # consistent no matter how topology changed this step.
+        # was the "mesh deletes itself while cutting" bug. Recomputing
+        # both attributes together whenever topology changes keeps them
+        # consistent; only POINTS need a write every frame (particles are
+        # always moving), which is why that Set() call sits outside the
+        # `if` below.
         #
         # Safety net: if the solver ever blows up (NaN/Inf positions, from
         # any cause), do NOT push that into the renderer -- a degenerate
@@ -1797,18 +1830,19 @@ class WarpSoftBodySim:
         if num_tris != self._last_tri_count:
             self._cube_mesh.GetFaceVertexCountsAttr().Set(
                 np.full(num_tris, 3, dtype=np.int32).tolist())
+            self._cube_mesh.GetFaceVertexIndicesAttr().Set(tri_indices.tolist())
             if self._cube_color_pv is not None:
-                self._cube_color_pv.Set(_vec3f_list(self._cube.tri_colors))
+                self._cube_color_pv.Set(_vec3f_array(self._cube.tri_colors))
             self._last_tri_count = num_tris
-        self._cube_mesh.GetPointsAttr().Set(_vec3f_list(cube_pos_np))
-        self._cube_mesh.GetFaceVertexIndicesAttr().Set(
-            tri_indices.tolist())
+        self._cube_mesh.GetPointsAttr().Set(_vec3f_array(cube_pos_np))
         return False
 
     # ------------------------------------------------------------------
     def _spawn(self):
         self._probe_last_good = None
         self._cut_last_xy = None
+        self._collider_cache = []
+        self._collider_rescan_counter = 0
         self._cube = SoftBodyCube(
             center=SOFT_CENTER,
             half_x=SOFT_HALF_X,
@@ -1828,7 +1862,7 @@ class WarpSoftBodySim:
         self._cube_mesh.CreateFaceVertexIndicesAttr(
             self._cube.tri_indices.tolist())
         self._cube_mesh.CreatePointsAttr(
-            _vec3f_list(self._cube.pos.numpy()))
+            _vec3f_array(self._cube.pos.numpy()))
         # Per-face (uniform) display color: skin on the outer surface,
         # muscle red on any face a cut has exposed. CreatePrimvar is a
         # no-op if it already exists from a prior spawn (e.g. RESET), so
@@ -1839,7 +1873,7 @@ class WarpSoftBodySim:
             ).CreatePrimvar(
                 "displayColor", Sdf.ValueTypeNames.Color3fArray,
                 UsdGeom.Tokens.uniform)
-        self._cube_color_pv.Set(_vec3f_list(self._cube.tri_colors))
+        self._cube_color_pv.Set(_vec3f_array(self._cube.tri_colors))
         self._last_tri_count = num_tris
 
     def _set_probe_position(self, pos: tuple):
