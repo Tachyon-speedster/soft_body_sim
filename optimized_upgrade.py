@@ -15,11 +15,12 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 SOFT_BODY_PRIM_PATH = "/World/WarpSoftBody"
 BASE_PRIM_PATH      = "/World/WarpBase"
 PROBE_PRIM_PATH     = "/World/WarpProbe"
+BLADE_PRIM_PATH     = "/World/WarpProbeBlade"
 GROUND_PRIM_PATH    = "/World/WarpGroundViz"
 LIGHT_PRIM_PATH     = "/World/WarpDomeLight"
 
 _OWN_PATHS = {SOFT_BODY_PRIM_PATH, GROUND_PRIM_PATH,
-              LIGHT_PRIM_PATH, "/World/Ground"}
+              LIGHT_PRIM_PATH, "/World/Ground", BLADE_PRIM_PATH}
 
 # ---------------------------------------------------------------------------
 # Geometry — all in metres
@@ -1622,19 +1623,28 @@ class WarpSoftBodySim:
         # The capsule above stays exactly as it was -- it's still what
         # PhysX and the soft body's own capsule-vs-particle collision/
         # cutting math actually use, untouched. Hide it and show a
-        # scalpel-blade-shaped mesh in its place instead, parented under
-        # it so it rides along with the same per-frame translate op with
-        # zero extra bookkeeping. Purely cosmetic: no CollisionAPI on the
-        # blade mesh, so gather_colliders() never sees it (and its path
-        # is already under PROBE_PRIM_PATH, which is skipped anyway).
+        # scalpel-blade-shaped mesh in its place instead.
+        #
+        # IMPORTANT: the blade is its own top-level sibling prim, NOT a
+        # child of the capsule. USD visibility is inherited downward with
+        # no override -- a prim set invisible makes every descendant
+        # invisible too, no exceptions -- so nesting the blade under the
+        # now-hidden capsule would hide the blade right along with it
+        # (which is exactly what made the probe disappear entirely). As
+        # an independent prim its own translate op is synced to match the
+        # capsule's every frame instead (see the per-frame update below).
         UsdGeom.Imageable(probe.GetPrim()).MakeInvisible()
         blade_pts, blade_fc, blade_fi = _build_scalpel_blade_geometry()
-        blade = UsdGeom.Mesh.Define(stage, Sdf.Path(PROBE_PRIM_PATH + "/Blade"))
+        blade = UsdGeom.Mesh.Define(stage, Sdf.Path(BLADE_PRIM_PATH))
         blade.CreateDoubleSidedAttr(True)
         blade.CreatePointsAttr([Gf.Vec3f(*p) for p in blade_pts])
         blade.CreateFaceVertexCountsAttr(blade_fc)
         blade.CreateFaceVertexIndicesAttr(blade_fi)
         blade.CreateDisplayColorAttr([Gf.Vec3f(0.80, 0.82, 0.85)])  # steel
+        blade_xfp = UsdGeom.Xformable(blade.GetPrim())
+        self._blade_translate_op = blade_xfp.AddTranslateOp()
+        self._blade_translate_op.Set(Gf.Vec3d(*PROBE_CENTER))
+        self._blade = blade
 
         # Soft body render mesh (points written each frame). Color is a
         # per-face primvar (skin vs. muscle), authored once self._cube
