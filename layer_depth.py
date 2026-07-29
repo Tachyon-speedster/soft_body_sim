@@ -1407,6 +1407,17 @@ class SoftBodyCube:
         all_edges = tets_np[:, pair_idx].reshape(-1, 2)
         all_edges = np.sort(all_edges, axis=1)
 
+        n = len(self._pos_list)   # always current; self.num_particles isn't
+                                    # updated until AFTER this call returns
+        if n >= (1 << 31):
+            # 32 bits/field gives an enormous budget (2 billion particles)
+            # before this packing could overflow int64 -- unreachable in
+            # practice, but fail loudly rather than silently wrap/corrupt
+            # if it somehow ever is reached.
+            raise RuntimeError(
+                f"_rebuild_structural_edges: particle count {n} exceeds "
+                f"the packed-edge-key dedup scheme's budget -- this soft "
+                f"body has grown far beyond its intended scale.")
         keys = (all_edges[:, 0].astype(np.int64) << 32) | all_edges[:, 1].astype(np.int64)
         _, first_idx = np.unique(keys, return_index=True)
         uniq = all_edges[first_idx]
@@ -1460,12 +1471,24 @@ class SoftBodyCube:
         all_faces = tets_np[:, face_idx].reshape(-1, 3)   # original per-tet winding kept
         sorted_faces = np.sort(all_faces, axis=1)
 
-        n = self.num_particles if hasattr(self, "num_particles") else len(self._pos_list)
+        n = len(self._pos_list)   # always current; self.num_particles isn't
+                                    # updated until AFTER this call returns
         bits = self._FACE_KEY_BITS
         if n >= (1 << bits):
             # Defensive fallback for the (currently unreachable) case of
             # an enormous particle count outgrowing the packed key budget.
             bits = int(np.ceil(np.log2(n + 1))) + 1
+            if 3 * bits > 63:
+                # Packing 3 fields of this width would silently overflow/
+                # wrap the int64 key (numpy doesn't raise on shift
+                # overflow) and corrupt face dedup rather than just being
+                # slow -- fail loudly instead. This would need millions
+                # of particles to ever actually trigger.
+                raise RuntimeError(
+                    f"_rebuild_boundary_tris: particle count {n} is too "
+                    f"large for the packed-face-key dedup scheme (needs "
+                    f"{3 * bits} bits, int64 has 63 usable) -- this soft "
+                    f"body has grown far beyond its intended scale.")
         a64 = sorted_faces[:, 0].astype(np.int64)
         b64 = sorted_faces[:, 1].astype(np.int64)
         c64 = sorted_faces[:, 2].astype(np.int64)
@@ -1880,7 +1903,6 @@ def _build_scalpel_tool_geometry():
     # -- Handle: a plain round cylinder (as requested -- nothing fancy),
     # from the blade join up to the grip butt, with end caps. --
     HANDLE_SIDES = 14
-    base_idx = len(points)
     ring_bottom, ring_top = [], []
     for k in range(HANDLE_SIDES):
         ang = 2.0 * math.pi * k / HANDLE_SIDES
@@ -2364,8 +2386,8 @@ class WarpSoftBodySim:
             self._cube.tri_indices.tolist())
         self._cube_mesh.CreatePointsAttr(
             _vec3f_array(self._cube.pos.numpy()))
-        # Per-face (uniform) display color: skin on the outer surface,
-        # muscle red on any face a cut has exposed. CreatePrimvar is a
+        # Per-face (uniform) display color: skin/fat/muscle by depth (see
+        # TISSUE_LAYERS), blended at layer transitions. CreatePrimvar is a
         # no-op if it already exists from a prior spawn (e.g. RESET), so
         # this is safe to call every time -- only the values change.
         if self._cube_color_pv is None:
@@ -2435,4 +2457,3 @@ class WarpSoftBodySim:
         except Exception as e:
             carb.log_warn(f"[WarpSoftBody] failed to reset xform order on "
                            f"{prim_path}: {e}")
-          
