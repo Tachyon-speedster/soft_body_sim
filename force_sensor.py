@@ -73,9 +73,9 @@ class ForceFeedbackSensor:
     def __init__(
         self,
         calibration_gain: float = 1.0,
-        tare_n: float = -1.5,
-        noise_std_n: float = 0.5,
-        smoothing_alpha: float = 0.35,
+        tare_n: float = 0.0,
+        noise_std_n: float = 0.0,
+        smoothing_alpha: float = 0.5,
         history_seconds: float = 15.0,
         sample_hz: float = 60.0,
     ):
@@ -86,14 +86,33 @@ class ForceFeedbackSensor:
         # Baseline offset: real readings sit at a small negative value at
         # rest (tool weight / mounting bias on the real F/T sensor), not
         # exactly 0N -- see reading_1/reading_2 baseline means (~-1 to -2N).
+        # Defaults to 0 here: this class is now used for the LIVE, in-sim
+        # feedback signal, and a nonzero tare with no context just reads
+        # as "phantom force when nothing is touching." Set tare_n=-1.5
+        # explicitly (see for_report_matching() below) only when you
+        # deliberately want the sim trace to visually match a real F/T
+        # sensor's rest offset for a report figure.
         self.tare_n = tare_n
         # Sensor noise floor. Measured from the two supplied readings:
-        # std ~= 0.46-0.58N on the resting baseline. Set to 0 to see the
-        # sim's raw signal with no added realism.
+        # std ~= 0.46-0.58N on the resting baseline. Defaults to 0 here --
+        # this noise was being added to EVERY reading unconditionally,
+        # including the live in-viewport feedback used while actually
+        # testing the probe. Since the real recovered contact signal at
+        # this rod radius/mesh resolution is itself only ~0.1-0.5N
+        # (similar order of magnitude to the old 0.5N noise std), that
+        # noise was completely swamping the real touch signal: it made
+        # the reading look random at rest AND made pressing into the pad
+        # look like it "didn't do anything" once you're used to the
+        # jitter. Only turn this back on (see for_report_matching()) once
+        # you've confirmed the raw signal responds to touch and you're
+        # building a final sim-vs-real comparison figure.
         self.noise_std_n = noise_std_n
         # EMA smoothing on top of the noise -- real F/T sensors are
         # internally filtered too; without this the raw PBD correction
-        # is spikier frame-to-frame than either real reading.
+        # is spikier frame-to-frame than either real reading. Bumped up
+        # from 0.35 -> 0.5 as a fairer default now that noise is off by
+        # default (0.35 was tuned to fight noise that no longer exists
+        # here by default).
         self.smoothing_alpha = smoothing_alpha
 
         maxlen = int(history_seconds * sample_hz) + 32
@@ -154,6 +173,33 @@ class ForceFeedbackSensor:
         f = np.array(self._f_hist)
         i = int(np.argmin(f))
         return float(f[i]), float(np.array(self._t_hist)[i])
+
+    def raw_peak(self):
+        """(raw_peak_force_n, t_of_peak) -- peak of the UNCALIBRATED
+        signal (before tare/gain/noise), i.e. straight out of
+        WarpSoftBodySim.get_probe_force_raw(). This is the number you
+        feed into calibrate_gain()/fit_gain_least_squares() as
+        sim_raw_peak_n -- calibrating against peak() (the already-tared,
+        already-gained value) would double-apply tare/gain."""
+        if not self._raw_hist:
+            return None
+        r = np.array(self._raw_hist)
+        i = int(np.argmin(r))
+        return float(r[i]), float(np.array(self._t_hist)[i])
+
+    @classmethod
+    def for_report_matching(cls, **overrides):
+        """Explicit opt-in to the OLD defaults (tare_n=-1.5,
+        noise_std_n=0.5, smoothing_alpha=0.35) that make a sim trace look
+        visually comparable to a real F/T sensor's noise floor and rest
+        offset (see reading_1.txt/reading_2.txt). Use this only when
+        building a final sim-vs-real comparison figure for your report --
+        not for the live in-sim probe feedback, where this noise is
+        larger than the real signal you're trying to see (see __init__
+        docstring above)."""
+        kwargs = dict(tare_n=-1.5, noise_std_n=0.5, smoothing_alpha=0.35)
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
     def baseline_mean(self, threshold_n: float = -3.0):
         f = np.array(self._f_hist)
