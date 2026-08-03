@@ -428,6 +428,49 @@ def collide_sphere(
 
 
 @wp.kernel
+def collide_sphere_sensed(
+    pred:     wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=wp.float32),
+    vel:      wp.array(dtype=wp.vec3),
+    center:   wp.vec3,
+    radius:   wp.float32,
+    skin:     wp.float32,
+    friction: wp.float32,
+    inv_sub_dt2:  wp.float32,
+    force_accum:  wp.array(dtype=wp.vec3),
+    contact_count: wp.array(dtype=wp.int32),
+    pen_force_accum: wp.array(dtype=wp.float32),
+    contact_stiffness: wp.float32,
+):
+    # Same contact math as collide_sphere, but also recovers a Newton-
+    # scale contact force (F = m*dx/h^2, see collide_capsule_sensed /
+    # force_sensor.py) so any manually-added sphere collider (Create >
+    # Shapes > Sphere + Collider Preset) can drive the force-feedback
+    # panel, not just the built-in WarpProbe.
+    tid = wp.tid()
+    if inv_mass[tid] == 0.0:
+        return
+    p    = pred[tid]
+    diff = p - center
+    dist = wp.length(diff)
+    lim  = radius + skin
+    if dist < lim and dist > 1.0e-6:
+        n = diff / dist
+        new_p = center + n * lim
+        disp  = new_p - p
+        pred[tid] = new_p
+        mass = 1.0 / inv_mass[tid]
+        f_on_particle = disp * (mass * inv_sub_dt2)
+        wp.atomic_add(force_accum, 0, -f_on_particle)
+        wp.atomic_add(contact_count, 0, 1)
+        wp.atomic_add(pen_force_accum, 0, (lim - dist) * contact_stiffness)
+        v  = vel[tid]
+        vn = wp.dot(v, n)
+        if vn < 0.0:
+            vel[tid] = v - n * (vn * (1.0 - friction))
+
+
+@wp.kernel
 def collide_box(
     pred:     wp.array(dtype=wp.vec3),
     inv_mass: wp.array(dtype=wp.float32),
@@ -473,6 +516,66 @@ def collide_box(
 
 
 @wp.kernel
+def collide_box_sensed(
+    pred:     wp.array(dtype=wp.vec3),
+    inv_mass: wp.array(dtype=wp.float32),
+    vel:      wp.array(dtype=wp.vec3),
+    center:   wp.vec3,
+    row0:     wp.vec3,
+    row1:     wp.vec3,
+    row2:     wp.vec3,
+    half_x:   wp.float32,
+    half_y:   wp.float32,
+    half_z:   wp.float32,
+    skin:     wp.float32,
+    friction: wp.float32,
+    inv_sub_dt2:  wp.float32,
+    force_accum:  wp.array(dtype=wp.vec3),
+    contact_count: wp.array(dtype=wp.int32),
+    pen_force_accum: wp.array(dtype=wp.float32),
+    contact_stiffness: wp.float32,
+):
+    # Same contact math as collide_box, plus force recovery (see
+    # collide_sphere_sensed above) -- lets a manually-added Cube collider
+    # drive the force-feedback panel too.
+    tid = wp.tid()
+    if inv_mass[tid] == 0.0:
+        return
+    p  = pred[tid]
+    dp = p - center
+    lx = wp.dot(dp, row0)
+    ly = wp.dot(dp, row1)
+    lz = wp.dot(dp, row2)
+    hx = half_x + skin
+    hy = half_y + skin
+    hz = half_z + skin
+    if lx > -hx and lx < hx and ly > -hy and ly < hy and lz > -hz and lz < hz:
+        dx_neg = lx + hx;  dx_pos = hx - lx
+        dy_neg = ly + hy;  dy_pos = hy - ly
+        dz_neg = lz + hz;  dz_pos = hz - lz
+        min_d = dx_neg
+        nx = -1.0; ny = 0.0; nz = 0.0
+        if dx_pos < min_d: min_d = dx_pos; nx =  1.0; ny = 0.0; nz = 0.0
+        if dy_neg < min_d: min_d = dy_neg; nx =  0.0; ny = -1.0; nz = 0.0
+        if dy_pos < min_d: min_d = dy_pos; nx =  0.0; ny =  1.0; nz = 0.0
+        if dz_neg < min_d: min_d = dz_neg; nx =  0.0; ny =  0.0; nz = -1.0
+        if dz_pos < min_d: min_d = dz_pos; nx =  0.0; ny =  0.0; nz =  1.0
+        n_world = row0 * nx + row1 * ny + row2 * nz
+        new_p = p + n_world * min_d
+        disp  = new_p - p
+        pred[tid] = new_p
+        mass = 1.0 / inv_mass[tid]
+        f_on_particle = disp * (mass * inv_sub_dt2)
+        wp.atomic_add(force_accum, 0, -f_on_particle)
+        wp.atomic_add(contact_count, 0, 1)
+        wp.atomic_add(pen_force_accum, 0, min_d * contact_stiffness)
+        v  = vel[tid]
+        vn = wp.dot(v, n_world)
+        if vn < 0.0:
+            vel[tid] = v - n_world * (vn * (1.0 - friction))
+
+
+@wp.kernel
 def collide_cylinder(
     pred:          wp.array(dtype=wp.vec3),
     inv_mass:      wp.array(dtype=wp.float32),
@@ -497,6 +600,50 @@ def collide_cylinder(
     if dist < lim and dist > 1.0e-6:
         n = radial / dist
         pred[tid] = closest + n * lim
+        v = vel[tid]; vn = wp.dot(v, n)
+        if vn < 0.0: vel[tid] = v - n * (vn * (1.0 - friction))
+
+
+@wp.kernel
+def collide_cylinder_sensed(
+    pred:          wp.array(dtype=wp.vec3),
+    inv_mass:      wp.array(dtype=wp.float32),
+    vel:           wp.array(dtype=wp.vec3),
+    pipe_center:   wp.vec3,
+    pipe_axis:     wp.vec3,
+    collide_radius: wp.float32,
+    pipe_half_len: wp.float32,
+    skin:          wp.float32,
+    friction:      wp.float32,
+    inv_sub_dt2:  wp.float32,
+    force_accum:  wp.array(dtype=wp.vec3),
+    contact_count: wp.array(dtype=wp.int32),
+    pen_force_accum: wp.array(dtype=wp.float32),
+    contact_stiffness: wp.float32,
+):
+    # Same contact math as collide_cylinder, plus force recovery (see
+    # collide_sphere_sensed above) -- lets a manually-added Cylinder
+    # collider drive the force-feedback panel too.
+    tid = wp.tid()
+    if inv_mass[tid] == 0.0:
+        return
+    p       = pred[tid]
+    dp      = p - pipe_center
+    t_ax    = wp.clamp(wp.dot(dp, pipe_axis), -pipe_half_len, pipe_half_len)
+    closest = pipe_center + pipe_axis * t_ax
+    radial  = p - closest
+    dist    = wp.length(radial)
+    lim     = collide_radius + skin
+    if dist < lim and dist > 1.0e-6:
+        n = radial / dist
+        new_p = closest + n * lim
+        disp  = new_p - p
+        pred[tid] = new_p
+        mass = 1.0 / inv_mass[tid]
+        f_on_particle = disp * (mass * inv_sub_dt2)
+        wp.atomic_add(force_accum, 0, -f_on_particle)
+        wp.atomic_add(contact_count, 0, 1)
+        wp.atomic_add(pen_force_accum, 0, (lim - dist) * contact_stiffness)
         v = vel[tid]; vn = wp.dot(v, n)
         if vn < 0.0: vel[tid] = v - n * (vn * (1.0 - friction))
 
@@ -585,6 +732,18 @@ def collide_capsule_sensed(
     # (Newton's third law: -sum of per-particle contact force) onto
     # force_accum[0] so the Python side can read one net (Fx,Fy,Fz) per
     # substep for the whole probe.
+    #
+    # NOTE: this is no longer the ONLY sensed collider. gather_colliders()
+    # now tags every scene-scanned collider (any Sphere/Cube/Capsule/
+    # Cylinder/Cone you add via Create > Shapes + Collider Preset) with
+    # "sense": True as well, and _dispatch_collider routes each shape to
+    # its own *_sensed kernel (collide_sphere_sensed, collide_box_sensed,
+    # collide_cylinder_sensed, collide_cone_sensed -- same F=m*dx/h^2
+    # math, defined near each shape's plain kernel above) when that flag
+    # is set. So force_accum[0] is now the net reaction from WHATEVER is
+    # touching the pad this substep, probe or otherwise -- fixing the
+    # "deforms the mesh but Force_Z stays 0.0 N" bug that showed up when
+    # poking with a hand-added shape instead of dragging WarpProbe.
     #
     # ALSO tracks two diagnostics, purely to separate "geometry never
     # touches" from "geometry touches but the recovered force is ~0":
@@ -675,6 +834,58 @@ def collide_cone(
 
 
 @wp.kernel
+def collide_cone_sensed(
+    pred:       wp.array(dtype=wp.vec3),
+    inv_mass:   wp.array(dtype=wp.float32),
+    vel:        wp.array(dtype=wp.vec3),
+    apex:       wp.vec3,
+    axis:       wp.vec3,
+    half_angle: wp.float32,
+    height:     wp.float32,
+    skin:       wp.float32,
+    friction:   wp.float32,
+    inv_sub_dt2:  wp.float32,
+    force_accum:  wp.array(dtype=wp.vec3),
+    contact_count: wp.array(dtype=wp.int32),
+    pen_force_accum: wp.array(dtype=wp.float32),
+    contact_stiffness: wp.float32,
+):
+    # Same contact math as collide_cone, plus force recovery (see
+    # collide_sphere_sensed above) -- lets a manually-added Cone collider
+    # drive the force-feedback panel too.
+    tid = wp.tid()
+    if inv_mass[tid] == 0.0:
+        return
+    p = pred[tid]
+    v = p - apex
+    h = wp.dot(v, axis)
+    if h < -skin or h > height + skin:
+        return
+    h_c    = wp.clamp(h, 0.0, height)
+    radial = v - axis * h
+    dist   = wp.length(radial)
+    r_at_h = h_c * wp.tan(half_angle)
+    lim    = r_at_h + skin
+    if dist < lim:
+        if dist > 1.0e-6:
+            n = radial / dist
+        else:
+            n = wp.vec3(1.0, 0.0, 0.0)
+        new_p = apex + axis * h_c + n * lim
+        disp  = new_p - p
+        pred[tid] = new_p
+        mass = 1.0 / inv_mass[tid]
+        f_on_particle = disp * (mass * inv_sub_dt2)
+        wp.atomic_add(force_accum, 0, -f_on_particle)
+        wp.atomic_add(contact_count, 0, 1)
+        wp.atomic_add(pen_force_accum, 0, (lim - dist) * contact_stiffness)
+        vv = vel[tid]
+        vn = wp.dot(vv, n)
+        if vn < 0.0:
+            vel[tid] = vv - n * (vn * (1.0 - friction))
+
+
+@wp.kernel
 def update_velocity(
     pos:      wp.array(dtype=wp.vec3),
     pred:     wp.array(dtype=wp.vec3),
@@ -755,7 +966,8 @@ def gather_colliders(stage: Usd.Stage, skip_paths: set,
             sz = math.sqrt(mat4[2][0]**2+mat4[2][1]**2+mat4[2][2]**2)
             colliders.append({"shape": SHAPE_SPHERE,
                                "center": (cx,cy,cz),
-                               "radius": radius*max(sx,sy,sz)})
+                               "radius": radius*max(sx,sy,sz),
+                               "sense": True})
 
         elif prim.IsA(UsdGeom.Cube):
             cube = UsdGeom.Cube(prim)
@@ -771,7 +983,8 @@ def gather_colliders(stage: Usd.Stage, skip_paths: set,
             colliders.append({"shape": SHAPE_BOX, "center": (cx,cy,cz),
                                "row0": row0, "row1": row1, "row2": row2,
                                "half_x": half*sx, "half_y": half*sy,
-                               "half_z": half*sz})
+                               "half_z": half*sz,
+                               "sense": True})
 
         elif prim.IsA(UsdGeom.Capsule):
             cap    = UsdGeom.Capsule(prim)
@@ -786,7 +999,8 @@ def gather_colliders(stage: Usd.Stage, skip_paths: set,
             p0   = (cx-wax[0]*half_h, cy-wax[1]*half_h, cz-wax[2]*half_h)
             p1   = (cx+wax[0]*half_h, cy+wax[1]*half_h, cz+wax[2]*half_h)
             colliders.append({"shape": SHAPE_CAPSULE, "p0": p0, "p1": p1,
-                               "radius": radius*sx})
+                               "radius": radius*sx,
+                               "sense": True})
 
         elif prim.IsA(UsdGeom.Cylinder):
             cyl    = UsdGeom.Cylinder(prim)
@@ -807,7 +1021,8 @@ def gather_colliders(stage: Usd.Stage, skip_paths: set,
                                "center": (cx,cy,cz), "axis": wax,
                                "radius": radius*scale_r,
                                "collide_radius": radius*scale_r,
-                               "half_len": height*0.5*scale_h})
+                               "half_len": height*0.5*scale_h,
+                               "sense": True})
 
         elif prim.IsA(UsdGeom.Cone):
             cone   = UsdGeom.Cone(prim)
@@ -822,7 +1037,8 @@ def gather_colliders(stage: Usd.Stage, skip_paths: set,
                     cz-wax[2]*height*0.5)
             colliders.append({"shape": SHAPE_CONE, "apex": apex, "axis": wax,
                                "half_angle": math.atan2(radius*sx, height),
-                               "height": height})
+                               "height": height,
+                               "sense": True})
 
         elif prim.IsA(UsdGeom.Mesh):
             mesh     = UsdGeom.Mesh(prim)
@@ -876,13 +1092,15 @@ def gather_colliders(stage: Usd.Stage, skip_paths: set,
                                    "row0": row0, "row1": row1, "row2": row2,
                                    "half_x": float(oh[0]),
                                    "half_y": float(oh[1]),
-                                   "half_z": float(oh[2])})
+                                   "half_z": float(oh[2]),
+                                   "sense": True})
             else:
                 d = np.linalg.norm(wpts - cen, axis=1)
                 colliders.append({"shape": SHAPE_SPHERE,
                                    "center": (float(cen[0]),float(cen[1]),
                                               float(cen[2])),
-                                   "radius": float(d.max())})
+                                   "radius": float(d.max()),
+                                   "sense": True})
     return colliders
 
 
@@ -1751,7 +1969,8 @@ class SoftBodyCube:
         if sh == SHAPE_SPHERE:
             return {"shape": sh,
                     "center": wp.vec3(*c["center"]),
-                    "radius": float(c["radius"])}
+                    "radius": float(c["radius"]),
+                    "sense": bool(c.get("sense", False))}
         elif sh == SHAPE_BOX:
             r0, r1, r2 = c["row0"], c["row1"], c["row2"]
             return {"shape": sh,
@@ -1761,7 +1980,8 @@ class SoftBodyCube:
                     "row2": wp.vec3(float(r2[0]), float(r2[1]), float(r2[2])),
                     "half_x": float(c["half_x"]),
                     "half_y": float(c["half_y"]),
-                    "half_z": float(c["half_z"])}
+                    "half_z": float(c["half_z"]),
+                    "sense": bool(c.get("sense", False))}
         elif sh == SHAPE_CAPSULE:
             return {"shape": sh,
                     "p0": wp.vec3(*c["p0"]),
@@ -1773,13 +1993,15 @@ class SoftBodyCube:
                     "center": wp.vec3(*c["center"]),
                     "axis": wp.vec3(*c["axis"]),
                     "collide_radius": float(c.get("collide_radius", c["radius"])),
-                    "half_len": float(c["half_len"])}
+                    "half_len": float(c["half_len"]),
+                    "sense": bool(c.get("sense", False))}
         elif sh == SHAPE_CONE:
             return {"shape": sh,
                     "apex": wp.vec3(*c["apex"]),
                     "axis": wp.vec3(*c["axis"]),
                     "half_angle": float(c["half_angle"]),
-                    "height": float(c["height"])}
+                    "height": float(c["height"]),
+                    "sense": bool(c.get("sense", False))}
         # Unknown shape -- pass through unchanged (dispatch will just
         # silently no-op on it, same as before).
         return c
@@ -1789,28 +2011,47 @@ class SoftBodyCube:
         fields are already real wp.vec3 objects, so this only launches
         the matching kernel -- no per-call Python object construction."""
         sh = c["shape"]
+        sensed = c.get("sense", False)
+        # Common tail of args shared by every _sensed kernel variant --
+        # kept in one place so the "any shape can report force" wiring
+        # can't drift out of sync between shapes.
+        sense_args = [self._inv_sub_dt2, self.force_accum,
+                      self.contact_count, self.pen_force_accum,
+                      float(CONTACT_STIFFNESS)]
         if sh == SHAPE_SPHERE:
-            wp.launch(collide_sphere, dim=self.num_particles,
-                      inputs=[self.pred,self.inv_mass,self.vel,
-                               c["center"],c["radius"],
-                               float(SKIN),float(friction)],
-                      device=self.device)
+            if sensed:
+                wp.launch(collide_sphere_sensed, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["center"],c["radius"],
+                                   float(SKIN),float(friction)] + sense_args,
+                          device=self.device)
+            else:
+                wp.launch(collide_sphere, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["center"],c["radius"],
+                                   float(SKIN),float(friction)],
+                          device=self.device)
         elif sh == SHAPE_BOX:
-            wp.launch(collide_box, dim=self.num_particles,
-                      inputs=[self.pred,self.inv_mass,self.vel,
-                               c["center"], c["row0"], c["row1"], c["row2"],
-                               c["half_x"], c["half_y"], c["half_z"],
-                               float(SKIN),float(friction)],
-                      device=self.device)
+            if sensed:
+                wp.launch(collide_box_sensed, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["center"], c["row0"], c["row1"], c["row2"],
+                                   c["half_x"], c["half_y"], c["half_z"],
+                                   float(SKIN),float(friction)] + sense_args,
+                          device=self.device)
+            else:
+                wp.launch(collide_box, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["center"], c["row0"], c["row1"], c["row2"],
+                                   c["half_x"], c["half_y"], c["half_z"],
+                                   float(SKIN),float(friction)],
+                          device=self.device)
         elif sh == SHAPE_CAPSULE:
-            if c.get("sense", False):
+            if sensed:
                 wp.launch(collide_capsule_sensed, dim=self.num_particles,
                           inputs=[self.pred,self.inv_mass,self.vel,
                                    c["p0"], c["p1"],
-                                   c["radius"],float(SKIN),float(friction),
-                                   self._inv_sub_dt2, self.force_accum,
-                                   self.contact_count, self.pen_force_accum,
-                                   float(CONTACT_STIFFNESS)],
+                                   c["radius"],float(SKIN),float(friction)] + sense_args,
                           device=self.device)
             else:
                 wp.launch(collide_capsule, dim=self.num_particles,
@@ -1819,19 +2060,35 @@ class SoftBodyCube:
                                    c["radius"],float(SKIN),float(friction)],
                           device=self.device)
         elif sh == SHAPE_CYLINDER:
-            wp.launch(collide_cylinder, dim=self.num_particles,
-                      inputs=[self.pred,self.inv_mass,self.vel,
-                               c["center"], c["axis"],
-                               c["collide_radius"], c["half_len"],
-                               float(SKIN),float(friction)],
-                      device=self.device)
+            if sensed:
+                wp.launch(collide_cylinder_sensed, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["center"], c["axis"],
+                                   c["collide_radius"], c["half_len"],
+                                   float(SKIN),float(friction)] + sense_args,
+                          device=self.device)
+            else:
+                wp.launch(collide_cylinder, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["center"], c["axis"],
+                                   c["collide_radius"], c["half_len"],
+                                   float(SKIN),float(friction)],
+                          device=self.device)
         elif sh == SHAPE_CONE:
-            wp.launch(collide_cone, dim=self.num_particles,
-                      inputs=[self.pred,self.inv_mass,self.vel,
-                               c["apex"], c["axis"],
-                               c["half_angle"], c["height"],
-                               float(SKIN),float(friction)],
-                      device=self.device)
+            if sensed:
+                wp.launch(collide_cone_sensed, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["apex"], c["axis"],
+                                   c["half_angle"], c["height"],
+                                   float(SKIN),float(friction)] + sense_args,
+                          device=self.device)
+            else:
+                wp.launch(collide_cone, dim=self.num_particles,
+                          inputs=[self.pred,self.inv_mass,self.vel,
+                                   c["apex"], c["axis"],
+                                   c["half_angle"], c["height"],
+                                   float(SKIN),float(friction)],
+                          device=self.device)
 
     def step(
         self,
