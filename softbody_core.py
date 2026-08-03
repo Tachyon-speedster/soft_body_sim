@@ -180,6 +180,13 @@ SKIN = 0.0008   # 0.8mm collision skin
 # on first touch.
 CUT_ENGAGE_DEPTH = 0.0015   # 1.5mm past the top surface before cutting
 
+# Fixed N/m used ONLY by the diagnostic penetration-depth force estimate
+# (pen_force_accum in collide_capsule_sensed) -- a rough order-of-magnitude
+# stand-in for tissue stiffness, not fit to anything. Its only job is to
+# give a nonzero, non-collapsing signal to compare against the "real"
+# m*dx/h^2 recovered force while debugging why the latter reads 0N.
+CONTACT_STIFFNESS = 500.0   # N per metre of penetration
+
 # ---------------------------------------------------------------------------
 # Simulation constants
 # ---------------------------------------------------------------------------
@@ -538,6 +545,23 @@ def zero_vec3_single(arr: wp.array(dtype=wp.vec3)):
 
 
 @wp.kernel
+def zero_int32_single(arr: wp.array(dtype=wp.int32)):
+    # Same as zero_vec3_single but for the contact_count diagnostic
+    # counter -- see collide_capsule_sensed. Purely a debugging aid: lets
+    # the Python side tell "no particles are within collision range of
+    # the probe at all" apart from "particles are in range but the
+    # recovered force is ~0", which look identical from the force reading
+    # alone.
+    arr[0] = 0
+
+
+@wp.kernel
+def zero_float32_single(arr: wp.array(dtype=wp.float32)):
+    # Zeroes the pen_force_accum diagnostic (see collide_capsule_sensed).
+    arr[0] = 0.0
+
+
+@wp.kernel
 def collide_capsule_sensed(
     pred:         wp.array(dtype=wp.vec3),
     inv_mass:     wp.array(dtype=wp.float32),
@@ -549,6 +573,9 @@ def collide_capsule_sensed(
     friction:     wp.float32,
     inv_sub_dt2:  wp.float32,
     force_accum:  wp.array(dtype=wp.vec3),
+    contact_count: wp.array(dtype=wp.int32),
+    pen_force_accum: wp.array(dtype=wp.float32),
+    contact_stiffness: wp.float32,
 ):
     # Identical contact math to collide_capsule -- this is the probe's
     # own capsule collider, tagged "sense" in _update_impl -- but it also
@@ -558,6 +585,25 @@ def collide_capsule_sensed(
     # (Newton's third law: -sum of per-particle contact force) onto
     # force_accum[0] so the Python side can read one net (Fx,Fy,Fz) per
     # substep for the whole probe.
+    #
+    # ALSO tracks two diagnostics, purely to separate "geometry never
+    # touches" from "geometry touches but the recovered force is ~0":
+    #   contact_count    -- how many particles were actually within
+    #                        collision range this call, at all.
+    #   pen_force_accum  -- an INDEPENDENT force estimate, computed
+    #                        directly from penetration depth (lim - dist)
+    #                        times a fixed contact_stiffness, rather than
+    #                        from the position correction. If the mesh
+    #                        solver has already converged the correction
+    #                        signal away to ~0 at steady contact (a known
+    #                        failure mode of the m*dx/h^2 method when the
+    #                        constraint solver runs enough iterations to
+    #                        nearly satisfy every spring each substep --
+    #                        see softbody_core.py's diagnostic notes),
+    #                        this penetration-depth signal should still
+    #                        be nonzero as long as contact_count > 0,
+    #                        since it doesn't depend on how much the
+    #                        *previous* substep already corrected.
     tid = wp.tid()
     if inv_mass[tid] == 0.0:
         return
@@ -581,6 +627,8 @@ def collide_capsule_sensed(
         mass = 1.0 / inv_mass[tid]
         f_on_particle = disp * (mass * inv_sub_dt2)
         wp.atomic_add(force_accum, 0, -f_on_particle)
+        wp.atomic_add(contact_count, 0, 1)
+        wp.atomic_add(pen_force_accum, 0, (lim - dist) * contact_stiffness)
         v  = vel[tid]
         vn = wp.dot(v, n)
         if vn < 0.0:
@@ -1106,6 +1154,16 @@ class SoftBodyCube:
         # cutting rebuild in _rebuild_gpu_arrays.
         self.force_accum      = wp.zeros(1, dtype=wp.vec3, device=device)
         self.last_probe_force = (0.0, 0.0, 0.0)   # raw Newtons, last step()
+        # Diagnostics -- see collide_capsule_sensed docstring. contact_count
+        # tells you whether the probe geometrically touched ANY particle
+        # at all this step(); pen_force_raw is an independent force
+        # estimate from penetration depth * CONTACT_STIFFNESS, to compare
+        # against last_probe_force (the position-correction-based one)
+        # when hunting a "touches but reads 0N" bug.
+        self.contact_count      = wp.zeros(1, dtype=wp.int32, device=device)
+        self.pen_force_accum    = wp.zeros(1, dtype=wp.float32, device=device)
+        self.last_contact_count = 0
+        self.last_pen_force_raw = 0.0
 
         # -- Python-side mutable mirrors, for cutting ------------------------------
         # (the wp arrays above are fixed-size; cutting adds particles and
@@ -1750,7 +1808,9 @@ class SoftBodyCube:
                           inputs=[self.pred,self.inv_mass,self.vel,
                                    c["p0"], c["p1"],
                                    c["radius"],float(SKIN),float(friction),
-                                   self._inv_sub_dt2, self.force_accum],
+                                   self._inv_sub_dt2, self.force_accum,
+                                   self.contact_count, self.pen_force_accum,
+                                   float(CONTACT_STIFFNESS)],
                           device=self.device)
             else:
                 wp.launch(collide_capsule, dim=self.num_particles,
@@ -1797,6 +1857,8 @@ class SoftBodyCube:
         # contact force over the whole frame, across all substeps.
         self._inv_sub_dt2 = 1.0 / (sub_dt * sub_dt)
         wp.launch(zero_vec3_single, dim=1, inputs=[self.force_accum], device=self.device)
+        wp.launch(zero_int32_single, dim=1, inputs=[self.contact_count], device=self.device)
+        wp.launch(zero_float32_single, dim=1, inputs=[self.pen_force_accum], device=self.device)
 
         # Pack every collider's wp.vec3 fields ONCE per step() call --
         # was previously done inside the inner substeps*solver_iters loop
@@ -1880,6 +1942,9 @@ class SoftBodyCube:
         self.last_probe_force = (float(fa[0]) / substeps,
                                   float(fa[1]) / substeps,
                                   float(fa[2]) / substeps)
+        # Diagnostics -- see collide_capsule_sensed / get_probe_debug_info().
+        self.last_contact_count = int(self.contact_count.numpy()[0])
+        self.last_pen_force_raw = float(self.pen_force_accum.numpy()[0]) / substeps
 
     def get_probe_force_raw(self):
         """(Fx, Fy, Fz) in Newtons, recovered from this frame's contact
@@ -1887,6 +1952,16 @@ class SoftBodyCube:
         Real Newton-scale numbers, but not yet scale-matched to a real F/T
         sensor -- feed them through ForceFeedbackSensor for that."""
         return self.last_probe_force
+
+    def get_probe_debug_info(self):
+        """(contact_count, pen_force_raw_n) for this frame -- see
+        collide_capsule_sensed's docstring. contact_count > 0 means the
+        probe geometrically touched at least one particle this step();
+        pen_force_raw is an independent penetration-depth-based force
+        estimate (N), which should stay nonzero for as long as
+        contact_count > 0, even if get_probe_force_raw() has decayed to
+        ~0 at a steady hold."""
+        return self.last_contact_count, self.last_pen_force_raw
 
 
 # ===========================================================================
@@ -2311,6 +2386,17 @@ class WarpSoftBodySim:
             return None
         return float(t[-1]), float(f[-1])
 
+    def get_probe_debug_info(self):
+        """(contact_count, pen_force_raw_n) for the most recent physics
+        step -- see WarpSoftBodyCube.get_probe_debug_info(). Use this to
+        tell apart "the probe never geometrically touches the mesh"
+        (contact_count stays 0) from "it touches, but the m*dx/h^2 force
+        recovery still reads ~0" (contact_count > 0, pen_force_raw_n
+        nonzero, get_force_reading_raw() near 0 anyway)."""
+        if self._cube is None:
+            return 0, 0.0
+        return self._cube.get_probe_debug_info()
+
     def calibrate_from_real_reading(self, reading_path: str, **find_kwargs):
         """One-call calibration: call this right after driving ONE full
         press-through-the-pad stroke in the live sim (noise/tare already
@@ -2497,6 +2583,21 @@ class WarpSoftBodySim:
         self._sim_time += step
         _fx, _fy, _fz = self._cube.get_probe_force_raw()
         self._force_sensor.record(self._sim_time, _fz)
+
+        # TEMPORARY debug instrumentation -- see get_probe_debug_info().
+        # Prints every ~0.5s (30 frames at 60fps) so it's readable instead
+        # of spamming every frame. Remove once the 0N-force bug is
+        # confirmed fixed; this is purely to tell "the probe never
+        # geometrically touches anything" apart from "it touches, but the
+        # recovered force collapses to ~0 anyway" -- those look identical
+        # from the Raw/Force_Z labels alone.
+        self._debug_frame_counter = getattr(self, "_debug_frame_counter", 0) + 1
+        if self._debug_frame_counter >= 30:
+            self._debug_frame_counter = 0
+            contacts, pen_force = self._cube.get_probe_debug_info()
+            carb.log_warn(
+                f"[WarpSoftBody][force-debug] contact_count={contacts} "
+                f"pen_force_raw={pen_force:.4f}N  m_dx_h2_force_z={_fz:.4f}N")
 
         # ---- Cutting: cut along wherever the rod's tip actually travels
         # in XY while it's pressed into the pad (within its footprint and
