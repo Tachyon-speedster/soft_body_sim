@@ -60,6 +60,9 @@ class UIBuilder:
         if f_hist.size:
             self._force_plot.set_data(*f_hist.tolist())
         self._force_live_label.text = f"Force_Z: {f_now:.1f} N"
+        raw_reading = self._scenario.get_force_reading_raw()
+        if raw_reading is not None:
+            self._force_raw_label.text = f"Raw: {raw_reading[1]:.2f} N"
         peak = self._scenario.get_force_peak()
         if peak is not None:
             self._force_peak_label.text = f"Peak: {peak[0]:.1f} N @ {peak[1]:.2f}s"
@@ -137,6 +140,7 @@ class UIBuilder:
                 )
                 with ui.HStack(spacing=8, height=0):
                     self._force_live_label = ui.Label("Force_Z: -- N", word_wrap=True)
+                    self._force_raw_label = ui.Label("Raw: -- N", word_wrap=True)
                     self._force_peak_label = ui.Label("Peak: -- N", word_wrap=True)
                     self._force_base_label = ui.Label("Baseline: -- N", word_wrap=True)
                 with ui.HStack(spacing=5, height=0):
@@ -242,6 +246,7 @@ class UIBuilder:
         self._scenario.reset_force_trace()
         self._force_plot.set_data(*[0.0, 0.0])
         self._force_live_label.text = "Force_Z: -- N"
+        self._force_raw_label.text = "Raw: -- N"
         self._force_peak_label.text = "Peak: -- N"
         self._force_base_label.text = "Baseline: -- N"
         self._force_export_label.text = ""
