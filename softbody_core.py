@@ -2840,30 +2840,36 @@ class WarpSoftBodySim:
         #
         # WHY pen_force_raw and not the plain m*dx/h^2 value: the m*dx/h^2
         # recovery (get_probe_force_raw()) only sees a nonzero number the
-        # instant a particle is FIRST pushed -- once the probe is held
-        # steady/embedded, the constraint solver has already resolved the
-        # penetration in a prior substep, so each new substep's
-        # *incremental* correction collapses to ~0 even though real,
-        # sustained contact is still happening (this is the documented
-        # failure mode in collide_capsule_sensed's own docstring, and is
-        # exactly what the force-debug log above was built to catch:
-        # contact_count>0 and pen_force_raw>0 while m_dx_h2_force_z==0.0
-        # means the CONTACT is real and the m*dx/h^2 SIGNAL is the thing
-        # that's blind, not the sim).
+        # instant a particle is FIRST pushed -- once contact has settled
+        # even slightly (which happens at ANY press speed, not just slow
+        # ones -- a fast flick just makes it settle after a bigger first
+        # spike), each new substep's *incremental* correction shrinks
+        # toward 0 even though real contact is still happening. This is
+        # the documented failure mode in collide_capsule_sensed's own
+        # docstring.
         #
-        # pen_force_raw is a direct penetration-depth * CONTACT_STIFFNESS
-        # spring estimate (see collide_capsule_sensed), so it stays live
-        # for as long as contact_count > 0, transient or sustained.
-        # Negated here (pen_force_raw is an unsigned magnitude that's
-        # positive while penetrating) to match the real sensor's
-        # convention where pressing into the pad reads NEGATIVE.
+        # Earlier this only fell back to pen_force_raw when m_dx_h2 was
+        # essentially exactly 0.0 -- but at a normal, un-flicked press
+        # speed m_dx_h2 typically settles to a small NONZERO-but-noisy
+        # residual (not exactly 0), so that condition silently kept using
+        # the noisy, unreliable m_dx_h2 number instead of ever falling
+        # back. Fast, high-velocity drags only "worked" because the
+        # violent motion produced large transient m_dx_h2 spikes that
+        # happened to be big enough to look like a real signal -- not
+        # because the underlying method became more correct.
+        #
+        # Fix: whenever there IS real contact (contact_count > 0), always
+        # use pen_force_raw -- a direct penetration-depth *
+        # CONTACT_STIFFNESS spring estimate (see collide_capsule_sensed)
+        # that stays proportional to how deep the probe actually sits,
+        # at any press speed, transient or held. Negated here
+        # (pen_force_raw is an unsigned magnitude that's positive while
+        # penetrating) to match the real sensor's convention where
+        # pressing into the pad reads NEGATIVE.
         self._sim_time += step
         _fx, _fy, _fz = self._cube.get_probe_force_raw()
         _contacts, _pen_force = self._cube.get_probe_debug_info()
-        if _contacts > 0:
-            effective_fz = -_pen_force if abs(_fz) < 1.0e-6 else _fz
-        else:
-            effective_fz = _fz
+        effective_fz = -_pen_force if _contacts > 0 else 0.0
         self._force_sensor.record(self._sim_time, effective_fz)
 
         # TEMPORARY debug instrumentation -- see get_probe_debug_info().
