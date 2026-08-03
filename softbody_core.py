@@ -2089,6 +2089,16 @@ class WarpSoftBodySim:
         # long session's plot keeps a stable time axis. reset_force_trace()
         # clears the sensor's history (call it whenever you want the plot
         # to start over, e.g. on RESET).
+        # Clean/live sensor: no synthetic noise, no tare (see
+        # force_sensor.py's __init__ docstring -- the old defaults added
+        # ~0.5N of Gaussian noise to EVERY reading, which is the same
+        # order of magnitude as the real recovered contact signal at this
+        # rod radius, so it was drowning out actual touch response and
+        # making rest readings look like random noise). Once you've
+        # confirmed the raw signal tracks touch (see calibrate_from_real_reading
+        # below and force_sensor property), use
+        # ForceFeedbackSensor.for_report_matching() for a *separate*
+        # sensor instance when building your final sim-vs-real figure.
         self._force_sensor = ForceFeedbackSensor()
         self._sim_time     = 0.0
 
@@ -2266,6 +2276,51 @@ class WarpSoftBodySim:
         """Direct access to the ForceFeedbackSensor, e.g. to retune
         calibration_gain/tare_n/noise_std_n from the UI or a console."""
         return self._force_sensor
+
+    def get_force_reading_raw(self):
+        """(t_seconds, raw_force_z_newtons) for the most recent frame --
+        the UNCALIBRATED signal straight out of get_probe_force_raw(),
+        before tare/gain/noise. Watch THIS while poking the pad: if it
+        moves as you press in and settles back near 0 when you lift off,
+        the physics/contact recovery itself is fine and any remaining
+        "randomness" you see elsewhere is the sensor model (noise/tare/
+        gain), not the sim. If this stays ~0 no matter how hard you
+        press, the probe isn't actually registering contact (check rod
+        position/radius, SKIN margin, and that the capsule collider is
+        being appended in _update_impl)."""
+        t, f = self._force_sensor.raw_history_arrays()
+        if t.size == 0:
+            return None
+        return float(t[-1]), float(f[-1])
+
+    def calibrate_from_real_reading(self, reading_path: str, **find_kwargs):
+        """One-call calibration: call this right after driving ONE full
+        press-through-the-pad stroke in the live sim (noise/tare already
+        off by default -- see _spawn()). Reads this run's raw contact
+        peak, the matching real TISSUE-ONLY peak from a supervisor
+        reading file (table-contact artifact excluded automatically --
+        see force_sensor.find_tissue_only_region), and sets
+        self._force_sensor.calibration_gain so the two match. Returns the
+        fitted gain.
+
+        NOTE: calibrates against raw_peak(), not peak() -- peak() is
+        already tare/gain/noise-processed, so calibrating against it
+        would double-apply tare/gain. See ForceFeedbackSensor.raw_peak().
+        """
+        from .force_sensor import real_tissue_peak_from_reading, calibrate_gain
+
+        raw = self._force_sensor.raw_peak()
+        if raw is None:
+            raise RuntimeError(
+                "no contact recorded yet -- press into the pad once "
+                "before calibrating")
+        sim_raw_peak_n, _t = raw
+        real_peak_n, _baseline = real_tissue_peak_from_reading(
+            reading_path, **find_kwargs)
+        gain = calibrate_gain(sim_raw_peak_n, self._force_sensor.tare_n,
+                               real_peak_n)
+        self._force_sensor.calibration_gain = gain
+        return gain
 
     # ------------------------------------------------------------------
     def update(self, step: float):
