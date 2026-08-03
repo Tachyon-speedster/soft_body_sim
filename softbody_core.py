@@ -162,6 +162,24 @@ PIPE_HALF_LEN        = ROD_HALF_LEN
 # than the grid spacing once combined with the slimmed ROD_RADIUS above.
 SKIN = 0.0008   # 0.8mm collision skin
 
+# How far PAST the top surface the tip must actually be before a cut is
+# allowed to fire, measured independently of the collision SKIN margin
+# above. This used to just be "probe_tip_z < pad_top_z + SKIN" -- i.e.
+# cutting engaged the instant the tip so much as grazed within 0.8mm of
+# the surface, which is also exactly the condition collide_capsule_sensed
+# uses to start pushing particles. Since cut_segment() ran BEFORE the
+# physics step in the same frame (see _update_impl), that meant: the
+# instant you touched the pad, the tissue right under the tip was severed
+# before collision ever got a chance to resolve any resistance against
+# it -- so the force sensor never saw anything but 0N, no matter how hard
+# or how long you pressed, while still visibly "cutting" a channel open.
+# Requiring a real puncture depth here (not just skin-margin contact)
+# gives contact resistance a chance to build and be measured -- matching
+# the real reading_1/reading_2 traces, which show a genuine ramp up to
+# ~-3 to -4N BEFORE the tissue actually gives way -- rather than parting
+# on first touch.
+CUT_ENGAGE_DEPTH = 0.0015   # 1.5mm past the top surface before cutting
+
 # ---------------------------------------------------------------------------
 # Simulation constants
 # ---------------------------------------------------------------------------
@@ -2436,39 +2454,22 @@ class WarpSoftBodySim:
                 "sense":  True,   # this is the probe -- recover force feedback
             })
 
-        # ---- Cutting: cut along wherever the rod's tip actually travels
-        # in XY while it's pressed into the pad (within its footprint and
-        # pushed down to/past its top surface). The tip -- not the rod's
-        # center -- is the working end that pokes/cuts. Unlike a single
-        # column index, this follows the tip's real path in any direction
-        # (X, Y, or a diagonal drag) and only severs the cells the tip
-        # actually swept through, one probe-radius segment at a time.
-        # Depth-aware: how far DOWN the tip has actually penetrated (not
-        # just whether it's touching) decides how deep the cut goes --
-        # a shallow graze only nicks the skin layer, not the whole
-        # skin/fat/muscle stack. ----
-        if probe_world is not None:
-            pwx, pwy, _ = probe_world
-            pad_top_z = SOFT_CENTER[2] + SOFT_HALF_Z
-            engaged = (
-                abs(pwx - SOFT_CENTER[0]) < SOFT_HALF_X
-                and abs(pwy - SOFT_CENTER[1]) < SOFT_HALF_Y
-                and probe_tip_z < pad_top_z + SKIN
-            )
-            if engaged:
-                min_iz = self._cube.depth_world_z_to_min_iz(probe_tip_z)
-                if self._cut_last_xy is not None:
-                    lx, ly = self._cut_last_xy
-                    self._cube.cut_segment(lx, ly, pwx, pwy, min_iz)
-                self._cut_last_xy = (pwx, pwy)
-            else:
-                # Tip lifted clear of the pad -- forget the trail so the
-                # next press-in starts a fresh cut instead of drawing a
-                # phantom line from wherever it last was.
-                self._cut_last_xy = None
-
-        # Physics step -- base collision passed separately so it runs every
-        # solver iteration (same priority as ground constraint)
+        # ---- Physics step FIRST -- base collision passed separately so
+        # it runs every solver iteration (same priority as ground
+        # constraint).
+        #
+        # IMPORTANT ORDERING: this used to run AFTER the cutting block
+        # below, which meant a cut fired THIS frame (at wherever the tip
+        # currently is) before collision ever got to push back against
+        # that same tissue -- so collide_capsule_sensed was resolving
+        # contact against topology that had just been severed out from
+        # under it, and the force sensor never saw anything but 0N (see
+        # CUT_ENGAGE_DEPTH docstring above for the full story). Stepping
+        # physics first means this frame's collision/force-sensing always
+        # sees the topology as it was BEFORE any cut this frame fires;
+        # the cut then applies for next frame's render, one frame later,
+        # which is imperceptible at 60fps and is the same lag every other
+        # deferred-mutation system in this file already tolerates.
         #
         # solver_iters comes from the adaptive controller (see
         # TARGET_FRAME_MS/_adaptive_iters): timed end-to-end below,
@@ -2496,6 +2497,41 @@ class WarpSoftBodySim:
         self._sim_time += step
         _fx, _fy, _fz = self._cube.get_probe_force_raw()
         self._force_sensor.record(self._sim_time, _fz)
+
+        # ---- Cutting: cut along wherever the rod's tip actually travels
+        # in XY while it's pressed into the pad (within its footprint and
+        # actually PAST the top surface by CUT_ENGAGE_DEPTH -- not just
+        # skin-margin contact, see the constant's docstring above). The
+        # tip -- not the rod's center -- is the working end that
+        # pokes/cuts. Unlike a single column index, this follows the
+        # tip's real path in any direction (X, Y, or a diagonal drag) and
+        # only severs the cells the tip actually swept through, one
+        # probe-radius segment at a time. Depth-aware: how far DOWN the
+        # tip has actually penetrated (not just whether it's touching)
+        # decides how deep the cut goes -- a shallow graze only nicks the
+        # skin layer, not the whole skin/fat/muscle stack. Runs AFTER
+        # step() now (see ordering note above), so this frame's force
+        # reading reflects the pre-cut contact, and the cut itself takes
+        # effect starting next frame. ----
+        if probe_world is not None:
+            pwx, pwy, _ = probe_world
+            pad_top_z = SOFT_CENTER[2] + SOFT_HALF_Z
+            engaged = (
+                abs(pwx - SOFT_CENTER[0]) < SOFT_HALF_X
+                and abs(pwy - SOFT_CENTER[1]) < SOFT_HALF_Y
+                and probe_tip_z < pad_top_z - CUT_ENGAGE_DEPTH
+            )
+            if engaged:
+                min_iz = self._cube.depth_world_z_to_min_iz(probe_tip_z)
+                if self._cut_last_xy is not None:
+                    lx, ly = self._cut_last_xy
+                    self._cube.cut_segment(lx, ly, pwx, pwy, min_iz)
+                self._cut_last_xy = (pwx, pwy)
+            else:
+                # Tip lifted clear of the pad -- forget the trail so the
+                # next press-in starts a fresh cut instead of drawing a
+                # phantom line from wherever it last was.
+                self._cut_last_xy = None
 
         # Write positions to USD render mesh. Face-vertex INDICES (and
         # per-face colors) are only re-uploaded on frames where the
