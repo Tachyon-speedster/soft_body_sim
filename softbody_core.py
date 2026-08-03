@@ -2848,13 +2848,40 @@ class WarpSoftBodySim:
         # geometrically touches anything" apart from "it touches, but the
         # recovered force collapses to ~0 anyway" -- those look identical
         # from the Raw/Force_Z labels alone.
+        #
+        # ALSO logs whether the probe tip is even over the pad's XY
+        # footprint and past its top surface in Z -- the most common
+        # reason for a permanent 0.0 N reading isn't a code bug at all,
+        # it's the probe having been dragged beside the pad (outside
+        # +/-SOFT_HALF_X / +/-SOFT_HALF_Y) rather than above it, in which
+        # case contact_count will correctly stay 0 forever regardless of
+        # how far down you push it.
         self._debug_frame_counter = getattr(self, "_debug_frame_counter", 0) + 1
         if self._debug_frame_counter >= 30:
             self._debug_frame_counter = 0
             contacts, pen_force = self._cube.get_probe_debug_info()
-            carb.log_warn(
-                f"[WarpSoftBody][force-debug] contact_count={contacts} "
-                f"pen_force_raw={pen_force:.4f}N  m_dx_h2_force_z={_fz:.4f}N")
+            pad_top_z_dbg = SOFT_CENTER[2] + SOFT_HALF_Z
+            if probe_world is not None:
+                pwx_dbg, pwy_dbg, _ = probe_world
+                in_footprint = (abs(pwx_dbg - SOFT_CENTER[0]) < SOFT_HALF_X
+                                and abs(pwy_dbg - SOFT_CENTER[1]) < SOFT_HALF_Y)
+                carb.log_warn(
+                    f"[WarpSoftBody][force-debug] contact_count={contacts} "
+                    f"pen_force_raw={pen_force:.4f}N  m_dx_h2_force_z={_fz:.4f}N  "
+                    f"probe_xy=({pwx_dbg:.4f},{pwy_dbg:.4f}) "
+                    f"pad_half=({SOFT_HALF_X:.4f},{SOFT_HALF_Y:.4f}) "
+                    f"in_footprint={in_footprint}  "
+                    f"probe_tip_z={probe_tip_z:.4f} pad_top_z={pad_top_z_dbg:.4f}")
+                if contacts == 0 and not in_footprint:
+                    carb.log_warn(
+                        "[WarpSoftBody][force-debug] probe is OUTSIDE the pad's "
+                        f"footprint (need |x|<{SOFT_HALF_X:.3f} and "
+                        f"|y|<{SOFT_HALF_Y:.3f} around the pad center) -- drag "
+                        "it back over the pad, this is not a code bug.")
+            else:
+                carb.log_warn(
+                    f"[WarpSoftBody][force-debug] contact_count={contacts} "
+                    f"pen_force_raw={pen_force:.4f}N  m_dx_h2_force_z={_fz:.4f}N")
 
         # ---- Cutting: cut along wherever the rod's tip actually travels
         # in XY while it's pressed into the pad (within its footprint and
