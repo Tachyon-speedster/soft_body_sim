@@ -2834,12 +2834,37 @@ class WarpSoftBodySim:
         )
         self._cube._check_cohesive_breaks()
 
-        # Force feedback: pull this frame's raw recovered force (Newtons,
-        # see get_probe_force_raw()) and run it through the sensor model
-        # (calibration gain, tare, noise, smoothing) -- see force_sensor.py.
+        # Force feedback: pull this frame's raw recovered force (Newtons)
+        # and run it through the sensor model (calibration gain, tare,
+        # noise, smoothing) -- see force_sensor.py.
+        #
+        # WHY pen_force_raw and not the plain m*dx/h^2 value: the m*dx/h^2
+        # recovery (get_probe_force_raw()) only sees a nonzero number the
+        # instant a particle is FIRST pushed -- once the probe is held
+        # steady/embedded, the constraint solver has already resolved the
+        # penetration in a prior substep, so each new substep's
+        # *incremental* correction collapses to ~0 even though real,
+        # sustained contact is still happening (this is the documented
+        # failure mode in collide_capsule_sensed's own docstring, and is
+        # exactly what the force-debug log above was built to catch:
+        # contact_count>0 and pen_force_raw>0 while m_dx_h2_force_z==0.0
+        # means the CONTACT is real and the m*dx/h^2 SIGNAL is the thing
+        # that's blind, not the sim).
+        #
+        # pen_force_raw is a direct penetration-depth * CONTACT_STIFFNESS
+        # spring estimate (see collide_capsule_sensed), so it stays live
+        # for as long as contact_count > 0, transient or sustained.
+        # Negated here (pen_force_raw is an unsigned magnitude that's
+        # positive while penetrating) to match the real sensor's
+        # convention where pressing into the pad reads NEGATIVE.
         self._sim_time += step
         _fx, _fy, _fz = self._cube.get_probe_force_raw()
-        self._force_sensor.record(self._sim_time, _fz)
+        _contacts, _pen_force = self._cube.get_probe_debug_info()
+        if _contacts > 0:
+            effective_fz = -_pen_force if abs(_fz) < 1.0e-6 else _fz
+        else:
+            effective_fz = _fz
+        self._force_sensor.record(self._sim_time, effective_fz)
 
         # TEMPORARY debug instrumentation -- see get_probe_debug_info().
         # Prints every ~0.5s (30 frames at 60fps) so it's readable instead
@@ -2868,6 +2893,7 @@ class WarpSoftBodySim:
                 carb.log_warn(
                     f"[WarpSoftBody][force-debug] contact_count={contacts} "
                     f"pen_force_raw={pen_force:.4f}N  m_dx_h2_force_z={_fz:.4f}N  "
+                    f"effective_fz_recorded={effective_fz:.4f}N  "
                     f"probe_xy=({pwx_dbg:.4f},{pwy_dbg:.4f}) "
                     f"pad_half=({SOFT_HALF_X:.4f},{SOFT_HALF_Y:.4f}) "
                     f"in_footprint={in_footprint}  "
