@@ -341,3 +341,45 @@ def fit_gain_least_squares(sim_raw_peaks, real_peaks):
     real_peaks = np.asarray(real_peaks, dtype=np.float64)
     gain = float(np.dot(sim_raw_peaks, real_peaks) / np.dot(sim_raw_peaks, sim_raw_peaks))
     return gain
+
+
+def double_logistic_force_model(t, Fb, A, k1, t1, k2, t2):
+    """F(t) = Fb - A[sigmoid(k1, t1) - sigmoid(k2, t2)] -- baseline ->
+    smooth decrease -> minimum -> smooth recovery -> baseline. This is a
+    DESCRIPTIVE model: something you fit TO a trace you already have (a
+    real F/T reading, or a genuinely recorded sim CSV) to summarize its
+    shape in six numbers. It is not a generator -- don't call this with
+    hand-picked parameters and present the output as "the simulation" or
+    "the real reading"; that's fabricating data twice over, once by
+    picking numbers and again by mislabeling the source."""
+    t = np.asarray(t, dtype=np.float64)
+    return Fb - A * (1.0 / (1.0 + np.exp(-k1 * (t - t1)))
+                      - 1.0 / (1.0 + np.exp(-k2 * (t - t2))))
+
+
+def fit_double_logistic(t, f, p0=None):
+    """Least-squares fit of double_logistic_force_model to an ACTUAL
+    (t, f) trace -- pass in a real reading's tissue-only region (see
+    find_tissue_only_region) or a genuinely recorded sim CSV, whichever
+    you want to characterize. Same function either way; which trace you
+    feed it is the honest part -- report which one you fit.
+
+    Returns a dict of the six fitted parameters plus the covariance
+    matrix (pcov) so you can quote a confidence interval, e.g.
+    k1_std = np.sqrt(np.diag(result["pcov"]))[2].
+    """
+    from scipy.optimize import curve_fit
+    t = np.asarray(t, dtype=np.float64)
+    f = np.asarray(f, dtype=np.float64)
+    if p0 is None:
+        n = len(f)
+        Fb0 = float(f[: max(n // 10, 1)].mean())
+        i_min = int(np.argmin(f))
+        A0 = float(Fb0 - f[i_min])
+        t1_0 = float(t[max(i_min - n // 10, 0)])
+        t2_0 = float(t[min(i_min + n // 10, n - 1)])
+        p0 = [Fb0, A0, 5.0, t1_0, 5.0, t2_0]
+    popt, pcov = curve_fit(double_logistic_force_model, t, f, p0=p0, maxfev=20000)
+    Fb, A, k1, t1, k2, t2 = [float(v) for v in popt]
+    return {"Fb": Fb, "A": A, "k1": k1, "t1": t1, "k2": k2, "t2": t2,
+            "pcov": pcov}
